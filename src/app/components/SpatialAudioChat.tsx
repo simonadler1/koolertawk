@@ -33,6 +33,7 @@ interface AudioConnection {
   peerConnection: RTCPeerConnection;
   audioElement: HTMLAudioElement;
   gainNode?: GainNode;
+  pannerNode?: PannerNode;
 }
 
 export default function SpatialAudioChat() {
@@ -74,6 +75,22 @@ export default function SpatialAudioChat() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       console.log("Audio context created");
+
+      // Configure the audio listener (the "ears" of the user)
+      const listener = audioContextRef.current.listener;
+      if (listener.forwardX) {
+        // Set up listener orientation (facing forward)
+        listener.forwardX.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.forwardY.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.forwardZ.setValueAtTime(-1, audioContextRef.current.currentTime);
+        listener.upX.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.upY.setValueAtTime(1, audioContextRef.current.currentTime);
+        listener.upZ.setValueAtTime(0, audioContextRef.current.currentTime);
+      } else {
+        // Fallback for older browsers
+        listener.setOrientation(0, 0, -1, 0, 1, 0);
+      }
+      console.log("Audio listener configured");
     }
 
     if (audioContextRef.current.state === "suspended") {
@@ -296,6 +313,27 @@ export default function SpatialAudioChat() {
     }
   }, []);
 
+  // Convert room percentage coordinates to Web Audio 3D coordinates
+  const convertToAudioCoordinates = useCallback((listenerPos: Position, sourcePos: Position) => {
+    // Room dimensions: 100% x 100% -> convert to meters (e.g., 10m x 10m room)
+    const roomWidthMeters = 10;
+    const roomHeightMeters = 10;
+
+    // Convert percentages to meters, centered at origin
+    const listenerX = (listenerPos.x / 100) * roomWidthMeters - (roomWidthMeters / 2);
+    const listenerZ = (listenerPos.y / 100) * roomHeightMeters - (roomHeightMeters / 2);
+
+    const sourceX = (sourcePos.x / 100) * roomWidthMeters - (roomWidthMeters / 2);
+    const sourceZ = (sourcePos.y / 100) * roomHeightMeters - (roomHeightMeters / 2);
+
+    // Calculate relative position (source relative to listener)
+    const relativeX = sourceX - listenerX;
+    const relativeY = 0; // Keep all audio at ear level
+    const relativeZ = sourceZ - listenerZ;
+
+    return { x: relativeX, y: relativeY, z: relativeZ };
+  }, []);
+
   const updateSpatialAudio = useCallback(() => {
     if (!currentUser || !audioContextRef.current) {
       console.log("⚠️ Cannot update spatial audio: missing currentUser or audioContext");
@@ -306,20 +344,36 @@ export default function SpatialAudioChat() {
 
     audioConnectionsRef.current.forEach((connection, userId) => {
       const otherUser = roomState.users.find((u) => u.id === userId);
-      if (otherUser && connection.gainNode) {
+      if (otherUser && connection.gainNode && connection.pannerNode) {
+        // Calculate distance-based gain
         const gain = calculateSpatialGain(currentUser.position, otherUser.position);
         const distance = Math.sqrt(
           Math.pow(otherUser.position.x - currentUser.position.x, 2) +
           Math.pow(otherUser.position.y - currentUser.position.y, 2)
         );
 
+        // Set gain
         connection.gainNode.gain.setValueAtTime(gain, audioContextRef.current!.currentTime);
-        console.log(`🔊 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)}`);
+
+        // Calculate and set 3D position for stereo positioning
+        const audioCoords = convertToAudioCoordinates(currentUser.position, otherUser.position);
+
+        // Use the newer setPosition method if available, otherwise fallback to individual properties
+        if (connection.pannerNode.positionX) {
+          connection.pannerNode.positionX.setValueAtTime(audioCoords.x, audioContextRef.current!.currentTime);
+          connection.pannerNode.positionY.setValueAtTime(audioCoords.y, audioContextRef.current!.currentTime);
+          connection.pannerNode.positionZ.setValueAtTime(audioCoords.z, audioContextRef.current!.currentTime);
+        } else {
+          // Fallback for older browsers
+          connection.pannerNode.setPosition(audioCoords.x, audioCoords.y, audioCoords.z);
+        }
+
+        console.log(`🎧 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)}, position=(${audioCoords.x.toFixed(1)}, ${audioCoords.y.toFixed(1)}, ${audioCoords.z.toFixed(1)})`);
       } else {
-        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
+        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}, pannerNode=${!!connection.pannerNode}`);
       }
     });
-  }, [currentUser, roomState.users, calculateSpatialGain]);
+  }, [currentUser, roomState.users, calculateSpatialGain, convertToAudioCoordinates]);
 
   const createPeerConnection = useCallback(
     async (userId: string, streamToUse?: MediaStream): Promise<RTCPeerConnection> => {
@@ -417,25 +471,40 @@ export default function SpatialAudioChat() {
 
           // Create Web Audio source directly from the MediaStream (no Audio element)
           const source = audioContextRef.current!.createMediaStreamSource(event.streams[0]);
+
+          // Create PannerNode for positional audio (HRTF preferred)
+          const pannerNode = audioContextRef.current!.createPanner();
+          pannerNode.panningModel = 'HRTF';
+          pannerNode.distanceModel = 'inverse';
+          pannerNode.refDistance = 1;
+          pannerNode.maxDistance = 10;
+          pannerNode.rolloffFactor = 1;
+          pannerNode.coneInnerAngle = 360;
+          pannerNode.coneOuterAngle = 0;
+          pannerNode.coneOuterGain = 0;
+
           const gainNode = audioContextRef.current!.createGain();
 
           // Set initial gain to 0 - will be set correctly by updateSpatialAudio
           gainNode.gain.setValueAtTime(0, audioContextRef.current!.currentTime);
 
-          source.connect(gainNode);
+          // Connect: MediaStreamSource → PannerNode → GainNode → Destination
+          source.connect(pannerNode);
+          pannerNode.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Audio graph connected for ${userId}: MediaStreamSource -> GainNode -> Destination`);
+          console.log(`🔊 Audio graph connected for ${userId}: MediaStreamSource -> PannerNode -> GainNode -> Destination`);
 
           // Create a dummy audio element for compatibility (not used for playback)
           const audioElement = new Audio();
           audioElement.muted = true; // Ensure it doesn't interfere
 
-          // Update the existing connection with the audio element and gain node
+          // Update the existing connection with the audio element, gain node, and panner node
           const existingConnection = audioConnectionsRef.current.get(userId);
           if (existingConnection) {
             existingConnection.audioElement = audioElement;
             existingConnection.gainNode = gainNode;
+            existingConnection.pannerNode = pannerNode;
             console.log(`✅ Updated audio connection for ${userId}`);
           } else {
             // Fallback: create new connection if it doesn't exist
@@ -444,18 +513,30 @@ export default function SpatialAudioChat() {
               peerConnection: pc,
               audioElement,
               gainNode,
+              pannerNode,
             };
             audioConnectionsRef.current.set(userId, connection);
             console.log(`✅ Created new audio connection for ${userId}`);
           }
 
-          // Set the initial spatial gain based on current positions
+          // Set the initial spatial gain and position based on current positions
           if (currentUser) {
             const otherUser = roomState.users.find((u) => u.id === userId);
             if (otherUser) {
               const initialGain = calculateSpatialGain(currentUser.position, otherUser.position);
               gainNode.gain.setValueAtTime(initialGain, audioContextRef.current!.currentTime);
-              console.log(`🎯 Set initial spatial gain for ${userId}: ${initialGain.toFixed(2)}`);
+
+              // Set initial 3D position
+              const audioCoords = convertToAudioCoordinates(currentUser.position, otherUser.position);
+              if (pannerNode.positionX) {
+                pannerNode.positionX.setValueAtTime(audioCoords.x, audioContextRef.current!.currentTime);
+                pannerNode.positionY.setValueAtTime(audioCoords.y, audioContextRef.current!.currentTime);
+                pannerNode.positionZ.setValueAtTime(audioCoords.z, audioContextRef.current!.currentTime);
+              } else {
+                pannerNode.setPosition(audioCoords.x, audioCoords.y, audioCoords.z);
+              }
+
+              console.log(`🎯 Set initial spatial audio for ${userId}: gain=${initialGain.toFixed(2)}, position=(${audioCoords.x.toFixed(1)}, ${audioCoords.y.toFixed(1)}, ${audioCoords.z.toFixed(1)})`);
             }
           }
 
