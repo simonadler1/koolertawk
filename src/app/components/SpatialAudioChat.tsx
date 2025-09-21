@@ -297,16 +297,29 @@ export default function SpatialAudioChat() {
   }, []);
 
   const updateSpatialAudio = useCallback(() => {
-    if (!currentUser || !audioContextRef.current) return;
+    if (!currentUser || !audioContextRef.current) {
+      console.log("⚠️ Cannot update spatial audio: missing currentUser or audioContext");
+      return;
+    }
+
+    console.log(`🔊 Updating spatial audio for ${audioConnectionsRef.current.size} connections`);
 
     audioConnectionsRef.current.forEach((connection, userId) => {
       const otherUser = roomState.users.find((u) => u.id === userId);
       if (otherUser && connection.gainNode) {
         const gain = calculateSpatialGain(currentUser.position, otherUser.position);
+        const distance = Math.sqrt(
+          Math.pow(otherUser.position.x - currentUser.position.x, 2) +
+          Math.pow(otherUser.position.y - currentUser.position.y, 2)
+        );
+
         connection.gainNode.gain.setValueAtTime(gain, audioContextRef.current!.currentTime);
+        console.log(`🔊 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)}`);
+      } else {
+        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
       }
     });
-  }, [currentUser?.position?.x, currentUser?.position?.y, roomState.users.length]);
+  }, [currentUser?.position?.x, currentUser?.position?.y, roomState.users.length, calculateSpatialGain]);
 
   const createPeerConnection = useCallback(
     async (userId: string): Promise<RTCPeerConnection> => {
@@ -370,43 +383,68 @@ export default function SpatialAudioChat() {
       }
 
       pc.ontrack = async (event) => {
-        console.log(`Received remote audio track from ${userId}`);
+        console.log(`🎵 Received remote audio track from ${userId}`);
+        console.log(`Stream details:`, {
+          streamId: event.streams[0]?.id,
+          tracks: event.streams[0]?.getTracks().map(t => ({
+            kind: t.kind,
+            enabled: t.enabled,
+            readyState: t.readyState,
+            muted: t.muted
+          }))
+        });
 
         try {
           // Ensure AudioContext is still active
           if (audioContextRef.current?.state === "suspended") {
+            console.log(`Resuming suspended audio context for ${userId}`);
             await audioContextRef.current.resume();
           }
 
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
+          audioElement.volume = 1.0;
+          audioElement.muted = false;
 
           // Add audio element error handling
           audioElement.onerror = (e) => {
-            console.error(`Audio playback error for user ${userId}:`, e);
+            console.error(`❌ Audio playback error for user ${userId}:`, e);
           };
 
           audioElement.onloadedmetadata = () => {
-            console.log(`Audio metadata loaded for user ${userId}`);
+            console.log(`✅ Audio metadata loaded for user ${userId}, duration: ${audioElement.duration}`);
           };
 
           audioElement.oncanplay = () => {
-            console.log(`Audio ready to play for user ${userId}`);
+            console.log(`✅ Audio ready to play for user ${userId}`);
+          };
+
+          audioElement.onplay = () => {
+            console.log(`▶️ Audio started playing for user ${userId}`);
+          };
+
+          audioElement.onpause = () => {
+            console.log(`⏸️ Audio paused for user ${userId}`);
           };
 
           const source = audioContextRef.current!.createMediaElementSource(audioElement);
           const gainNode = audioContextRef.current!.createGain();
 
+          // Set initial gain
+          gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
+
           source.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
+
+          console.log(`🔊 Audio graph connected for ${userId}: MediaElement -> GainNode -> Destination`);
 
           // Update the existing connection with the audio element and gain node
           const existingConnection = audioConnectionsRef.current.get(userId);
           if (existingConnection) {
             existingConnection.audioElement = audioElement;
             existingConnection.gainNode = gainNode;
-            console.log(`Updated audio connection for ${userId}`);
+            console.log(`✅ Updated audio connection for ${userId}`);
           } else {
             // Fallback: create new connection if it doesn't exist
             const connection: AudioConnection = {
@@ -416,10 +454,19 @@ export default function SpatialAudioChat() {
               gainNode,
             };
             audioConnectionsRef.current.set(userId, connection);
-            console.log(`Created new audio connection for ${userId}`);
+            console.log(`✅ Created new audio connection for ${userId}`);
           }
+
+          // Force play attempt
+          try {
+            await audioElement.play();
+            console.log(`🎵 Successfully started audio playback for ${userId}`);
+          } catch (playError) {
+            console.error(`❌ Failed to start audio playback for ${userId}:`, playError);
+          }
+
         } catch (error) {
-          console.error(`Error setting up audio for user ${userId}:`, error);
+          console.error(`❌ Error setting up audio for user ${userId}:`, error);
         }
       };
 
@@ -464,6 +511,15 @@ export default function SpatialAudioChat() {
 
       switch (data.type) {
         case "room_state":
+          console.log(`📊 Room state update:`, {
+            users: data.payload.users.map((u: User) => ({
+              name: u.name,
+              id: u.id,
+              audioEnabled: u.audioEnabled,
+              seatId: u.seatId
+            })),
+            totalUsers: data.payload.users.length
+          });
           setRoomState(data.payload);
           break;
 
@@ -472,6 +528,7 @@ export default function SpatialAudioChat() {
           break;
 
         case "error":
+          console.error("❌ Server error:", data.payload.message);
           alert(data.payload.message);
           break;
       }
@@ -525,7 +582,7 @@ export default function SpatialAudioChat() {
         case "audio_offer":
           // Use socket.id instead of currentUser?.id since they should be the same
           if (data.payload.targetUserId === socket.id) {
-            console.log(`Received audio offer from ${data.payload.fromUserId}`);
+            console.log(`📥 Received audio offer from ${data.payload.fromUserId}`);
             try {
               const pc = await createPeerConnection(data.payload.fromUserId);
               await pc.setRemoteDescription(data.payload.offer);
@@ -541,27 +598,31 @@ export default function SpatialAudioChat() {
                   },
                 })
               );
-              console.log(`Sent audio answer to ${data.payload.fromUserId}`);
+              console.log(`📤 Sent audio answer to ${data.payload.fromUserId}`);
             } catch (error) {
-              console.error(`Error handling audio offer from ${data.payload.fromUserId}:`, error);
+              console.error(`❌ Error handling audio offer from ${data.payload.fromUserId}:`, error);
             }
+          } else {
+            console.log(`⚠️ Ignoring audio offer not for me (target: ${data.payload.targetUserId}, me: ${socket.id})`);
           }
           break;
 
         case "audio_answer":
           if (data.payload.targetUserId === socket.id) {
-            console.log(`Received audio answer from ${data.payload.fromUserId}`);
+            console.log(`📥 Received audio answer from ${data.payload.fromUserId}`);
             const connection = audioConnectionsRef.current.get(data.payload.fromUserId);
             if (connection) {
               try {
                 await connection.peerConnection.setRemoteDescription(data.payload.answer);
-                console.log(`Set remote description for ${data.payload.fromUserId}`);
+                console.log(`✅ Set remote description for ${data.payload.fromUserId}`);
               } catch (error) {
-                console.error(`Error setting remote description for ${data.payload.fromUserId}:`, error);
+                console.error(`❌ Error setting remote description for ${data.payload.fromUserId}:`, error);
               }
             } else {
-              console.warn(`No connection found for user ${data.payload.fromUserId} when processing answer`);
+              console.warn(`⚠️ No connection found for user ${data.payload.fromUserId} when processing answer`);
             }
+          } else {
+            console.log(`⚠️ Ignoring audio answer not for me (target: ${data.payload.targetUserId}, me: ${socket.id})`);
           }
           break;
 
@@ -623,7 +684,7 @@ export default function SpatialAudioChat() {
       for (const otherUser of roomState.users) {
         if (otherUser.audioEnabled) {
           try {
-            console.log(`Creating offer for existing user ${otherUser.id}`);
+            console.log(`🔗 Creating offer for existing user ${otherUser.id} (${otherUser.name})`);
             const pc = await createPeerConnection(otherUser.id);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
@@ -637,10 +698,12 @@ export default function SpatialAudioChat() {
                 },
               })
             );
-            console.log(`Sent offer to existing user ${otherUser.id}`);
+            console.log(`📤 Sent offer to existing user ${otherUser.id} (${otherUser.name})`);
           } catch (error) {
-            console.error(`Error creating peer connection for ${otherUser.id}:`, error);
+            console.error(`❌ Error creating peer connection for ${otherUser.id}:`, error);
           }
+        } else {
+          console.log(`⚠️ Skipping ${otherUser.name} - audio disabled`);
         }
       }
     } catch (error) {
