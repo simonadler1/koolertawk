@@ -415,43 +415,21 @@ export default function SpatialAudioChat() {
             await audioContextRef.current.resume();
           }
 
-          const audioElement = new Audio();
-          audioElement.srcObject = event.streams[0];
-          audioElement.autoplay = true;
-          audioElement.volume = 1.0;
-          audioElement.muted = false;
-
-          // Add audio element error handling
-          audioElement.onerror = (e) => {
-            console.error(`❌ Audio playback error for user ${userId}:`, e);
-          };
-
-          audioElement.onloadedmetadata = () => {
-            console.log(`✅ Audio metadata loaded for user ${userId}, duration: ${audioElement.duration}`);
-          };
-
-          audioElement.oncanplay = () => {
-            console.log(`✅ Audio ready to play for user ${userId}`);
-          };
-
-          audioElement.onplay = () => {
-            console.log(`▶️ Audio started playing for user ${userId}`);
-          };
-
-          audioElement.onpause = () => {
-            console.log(`⏸️ Audio paused for user ${userId}`);
-          };
-
-          const source = audioContextRef.current!.createMediaElementSource(audioElement);
+          // Create Web Audio source directly from the MediaStream (no Audio element)
+          const source = audioContextRef.current!.createMediaStreamSource(event.streams[0]);
           const gainNode = audioContextRef.current!.createGain();
 
-          // Set initial gain
-          gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
+          // Set initial gain to 0 - will be set correctly by updateSpatialAudio
+          gainNode.gain.setValueAtTime(0, audioContextRef.current!.currentTime);
 
           source.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Audio graph connected for ${userId}: MediaElement -> GainNode -> Destination`);
+          console.log(`🔊 Audio graph connected for ${userId}: MediaStreamSource -> GainNode -> Destination`);
+
+          // Create a dummy audio element for compatibility (not used for playback)
+          const audioElement = new Audio();
+          audioElement.muted = true; // Ensure it doesn't interfere
 
           // Update the existing connection with the audio element and gain node
           const existingConnection = audioConnectionsRef.current.get(userId);
@@ -471,12 +449,14 @@ export default function SpatialAudioChat() {
             console.log(`✅ Created new audio connection for ${userId}`);
           }
 
-          // Force play attempt
-          try {
-            await audioElement.play();
-            console.log(`🎵 Successfully started audio playback for ${userId}`);
-          } catch (playError) {
-            console.error(`❌ Failed to start audio playback for ${userId}:`, playError);
+          // Set the initial spatial gain based on current positions
+          if (currentUser) {
+            const otherUser = roomState.users.find((u) => u.id === userId);
+            if (otherUser) {
+              const initialGain = calculateSpatialGain(currentUser.position, otherUser.position);
+              gainNode.gain.setValueAtTime(initialGain, audioContextRef.current!.currentTime);
+              console.log(`🎯 Set initial spatial gain for ${userId}: ${initialGain.toFixed(2)}`);
+            }
           }
 
         } catch (error) {
@@ -777,7 +757,62 @@ export default function SpatialAudioChat() {
   };
 
   const moveTo = (seatId: string) => {
-    if (!socket || !currentUser) return;
+    if (!socket || !currentUser) {
+      console.warn("⚠️ Cannot move: missing socket or currentUser");
+      return;
+    }
+
+    const targetSeat = roomState.seats.find(s => s.id === seatId);
+    if (!targetSeat) {
+      console.warn(`⚠️ Target seat ${seatId} not found`);
+      return;
+    }
+
+    if (targetSeat.occupied) {
+      console.warn(`⚠️ Target seat ${seatId} is occupied by ${targetSeat.userId}`);
+      return;
+    }
+
+    console.log(`🚶 Moving from ${currentUser.seatId} to ${seatId}`);
+
+    // Optimistic update: immediately update local state
+    const optimisticRoomState = { ...roomState };
+    const optimisticSeats = optimisticRoomState.seats.map(seat => {
+      if (seat.id === currentUser.seatId) {
+        // Free current seat
+        return { ...seat, occupied: false, userId: undefined };
+      } else if (seat.id === seatId) {
+        // Occupy new seat
+        return { ...seat, occupied: true, userId: currentUser.id };
+      }
+      return seat;
+    });
+
+    const optimisticUsers = optimisticRoomState.users.map(user => {
+      if (user.id === currentUser.id) {
+        const newSeat = targetSeat;
+        return {
+          ...user,
+          position: newSeat.position,
+          seatId: seatId
+        };
+      }
+      return user;
+    });
+
+    optimisticRoomState.seats = optimisticSeats;
+    optimisticRoomState.users = optimisticUsers;
+
+    // Update current user optimistically
+    const optimisticCurrentUser = {
+      ...currentUser,
+      position: targetSeat.position,
+      seatId: seatId
+    };
+
+    console.log(`🔮 Optimistic update: moving to position ${JSON.stringify(targetSeat.position)}`);
+    setRoomState(optimisticRoomState);
+    setCurrentUser(optimisticCurrentUser);
 
     socket.send(
       JSON.stringify({
@@ -1115,7 +1150,7 @@ export default function SpatialAudioChat() {
               {/* Hearing range indicator for current user */}
               {currentUser && (
                 <div
-                  className="absolute border-2 border-blue-600 border-dashed rounded-full pointer-events-none"
+                  className="absolute border-2 border-blue-600 border-dashed rounded-full pointer-events-none transition-all duration-300"
                   style={{
                     left: `${currentUser.position.x - 40}%`,
                     top: `${currentUser.position.y - 40}%`,
@@ -1123,6 +1158,19 @@ export default function SpatialAudioChat() {
                     height: "80%",
                   }}
                 />
+              )}
+
+              {/* Debug: Show position coordinates */}
+              {process.env.NODE_ENV === "development" && currentUser && (
+                <div
+                  className="absolute bg-blue-600 text-white text-xs px-2 py-1 rounded pointer-events-none"
+                  style={{
+                    left: `${currentUser.position.x}%`,
+                    top: `${currentUser.position.y - 8}%`,
+                  }}
+                >
+                  {Math.round(currentUser.position.x)},{Math.round(currentUser.position.y)}
+                </div>
               )}
             </div>
             <p className="text-sm text-black mt-2 font-semibold">
