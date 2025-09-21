@@ -455,7 +455,7 @@ export default function SpatialAudioChat() {
 
   useEffect(() => {
     const ws = new PartySocket({
-      host: process.env.NODE_ENV === "development" ? "localhost:1999" : process.env.PARTYKIT_URL!,
+      host: process.env.NODE_ENV === "development" ? "localhost:1999" : process.env.NEXT_PUBLIC_PARTYKIT_URL || "koolertawk-party.simonadler1.partykit.dev",
       room: "spatial-chat",
     });
 
