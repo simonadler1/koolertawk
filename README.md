@@ -28,28 +28,32 @@ Open [http://localhost:3000](http://localhost:3000) to access the application.
 
 ## Audio Architecture
 
-### Stable Audio Pipeline ⚠️ CRITICAL
-The application uses a **muted HTMLAudioElement + Web Audio pipeline** to ensure reliable playback and avoid "stream already in use" crashes:
+### Known-Good Audio Pipeline ⚠️ CRITICAL
+The application uses a **simplified muted HTMLAudioElement + Web Audio pipeline** based on commit 8691645:
 
 ```
 Remote MediaStream → HTMLAudioElement (muted) → Web Audio Graph → Speakers
                                                      ↓
-                                   MediaElementSource → PannerNode → GainNode → Destination
+                                        MediaElementSource → GainNode → Destination
 ```
 
 **Key Implementation Details:**
 - **HTMLAudioElement**: Set `srcObject`, `muted=true`, `volume=1.0`, then call `.play()`
 - **MediaElementSource**: Created from audio element (NOT directly from MediaStream)
-- **Immediate Kickstart**: `updateSpatialAudio()` called right after node wiring
-- **No Silent Periods**: Audio flows immediately with proper gain values
+- **Simple Chain**: MediaElementSource → GainNode → Destination (no PannerNode for now)
+- **Distance-Based Volume**: GainNode controlled by seat proximity
+- **Immediate Updates**: `updateSpatialAudio()` called right after connection
 
-**⚠️ Do NOT change this to direct MediaStreamSource - it will cause browser crashes!**
+**⚠️ CRITICAL SAFEGUARDS:**
+- **No direct MediaStreamSource**: Causes "stream already in use" browser crashes
+- **No optimistic state mutations**: Server-driven updates only for reliability
+- **Graceful degradation**: Failed audio connections don't break the app
 
-### Spatial Audio Features
+### Spatial Audio Features ✅ SIMPLIFIED
 - **Distance-Based Volume**: Closer users sound louder (inverse square law)
-- **Stereo Positioning**: Users positioned left/right/front/back in stereo field
 - **Hearing Range**: 80% room distance maximum, with multiple volume zones
-- **Optimistic Updates**: Position changes update audio immediately
+- **Server-Driven Updates**: Position changes update audio after server confirmation
+- **TODO**: 3D stereo positioning to be re-added incrementally after basic audio is stable
 
 ## Technology Stack
 

@@ -75,22 +75,7 @@ export default function SpatialAudioChat() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       console.log("Audio context created");
-
-      // Configure the audio listener (the "ears" of the user)
-      const listener = audioContextRef.current.listener;
-      if (listener.forwardX) {
-        // Set up listener orientation (facing forward)
-        listener.forwardX.setValueAtTime(0, audioContextRef.current.currentTime);
-        listener.forwardY.setValueAtTime(0, audioContextRef.current.currentTime);
-        listener.forwardZ.setValueAtTime(-1, audioContextRef.current.currentTime);
-        listener.upX.setValueAtTime(0, audioContextRef.current.currentTime);
-        listener.upY.setValueAtTime(1, audioContextRef.current.currentTime);
-        listener.upZ.setValueAtTime(0, audioContextRef.current.currentTime);
-      } else {
-        // Fallback for older browsers
-        listener.setOrientation(0, 0, -1, 0, 1, 0);
-      }
-      console.log("Audio listener configured");
+      // Skip complex listener configuration for now - just use defaults
     }
 
     if (audioContextRef.current.state === "suspended") {
@@ -313,26 +298,8 @@ export default function SpatialAudioChat() {
     }
   }, []);
 
-  // Convert room percentage coordinates to Web Audio 3D coordinates
-  const convertToAudioCoordinates = useCallback((listenerPos: Position, sourcePos: Position) => {
-    // Room dimensions: 100% x 100% -> convert to meters (e.g., 10m x 10m room)
-    const roomWidthMeters = 10;
-    const roomHeightMeters = 10;
-
-    // Convert percentages to meters, centered at origin
-    const listenerX = (listenerPos.x / 100) * roomWidthMeters - (roomWidthMeters / 2);
-    const listenerZ = (listenerPos.y / 100) * roomHeightMeters - (roomHeightMeters / 2);
-
-    const sourceX = (sourcePos.x / 100) * roomWidthMeters - (roomWidthMeters / 2);
-    const sourceZ = (sourcePos.y / 100) * roomHeightMeters - (roomHeightMeters / 2);
-
-    // Calculate relative position (source relative to listener)
-    const relativeX = sourceX - listenerX;
-    const relativeY = 0; // Keep all audio at ear level
-    const relativeZ = sourceZ - listenerZ;
-
-    return { x: relativeX, y: relativeY, z: relativeZ };
-  }, []);
+  // Simple spatial audio update - just distance-based gain for now
+  // TODO: Re-add positional audio after basic playback is stable
 
   const updateSpatialAudio = useCallback(() => {
     if (!currentUser || !audioContextRef.current) {
@@ -344,8 +311,8 @@ export default function SpatialAudioChat() {
 
     audioConnectionsRef.current.forEach((connection, userId) => {
       const otherUser = roomState.users.find((u) => u.id === userId);
-      if (otherUser && connection.gainNode && connection.pannerNode) {
-        // Calculate distance-based gain
+      if (otherUser && connection.gainNode) {
+        // Simple distance-based gain calculation
         const gain = calculateSpatialGain(currentUser.position, otherUser.position);
         const distance = Math.sqrt(
           Math.pow(otherUser.position.x - currentUser.position.x, 2) +
@@ -355,25 +322,17 @@ export default function SpatialAudioChat() {
         // Set gain
         connection.gainNode.gain.setValueAtTime(gain, audioContextRef.current!.currentTime);
 
-        // Calculate and set 3D position for stereo positioning
-        const audioCoords = convertToAudioCoordinates(currentUser.position, otherUser.position);
-
-        // Use the newer setPosition method if available, otherwise fallback to individual properties
-        if (connection.pannerNode.positionX) {
-          connection.pannerNode.positionX.setValueAtTime(audioCoords.x, audioContextRef.current!.currentTime);
-          connection.pannerNode.positionY.setValueAtTime(audioCoords.y, audioContextRef.current!.currentTime);
-          connection.pannerNode.positionZ.setValueAtTime(audioCoords.z, audioContextRef.current!.currentTime);
+        // Log with or without panner info
+        if (connection.pannerNode) {
+          console.log(`🎧 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)} (with panner)`);
         } else {
-          // Fallback for older browsers
-          connection.pannerNode.setPosition(audioCoords.x, audioCoords.y, audioCoords.z);
+          console.log(`🔊 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)} (gain only)`);
         }
-
-        console.log(`🎧 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)}, position=(${audioCoords.x.toFixed(1)}, ${audioCoords.y.toFixed(1)}, ${audioCoords.z.toFixed(1)})`);
       } else {
-        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}, pannerNode=${!!connection.pannerNode}`);
+        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
       }
     });
-  }, [currentUser, roomState.users, calculateSpatialGain, convertToAudioCoordinates]);
+  }, [currentUser, roomState.users, calculateSpatialGain]);
 
   const createPeerConnection = useCallback(
     async (userId: string, streamToUse?: MediaStream): Promise<RTCPeerConnection> => {
@@ -462,13 +421,6 @@ export default function SpatialAudioChat() {
           }))
         });
 
-        // Check if we already have an audio setup for this stream to prevent duplicates
-        const existingConnection = audioConnectionsRef.current.get(userId);
-        if (existingConnection?.audioElement?.srcObject === event.streams[0]) {
-          console.log(`⚠️ Already have audio setup for stream ${event.streams[0]?.id} from ${userId}, skipping`);
-          return;
-        }
-
         try {
           // Ensure AudioContext is still active
           if (audioContextRef.current?.state === "suspended") {
@@ -476,155 +428,88 @@ export default function SpatialAudioChat() {
             await audioContextRef.current.resume();
           }
 
-          // Create HTMLAudioElement for stable stream handling (muted for Web Audio control)
+          // KNOWN-GOOD PIPELINE: HTMLAudioElement -> MediaElementSource -> GainNode -> Destination
+          // This prevents "stream already in use" errors that crash browsers
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
           audioElement.muted = true; // Muted so Web Audio controls the volume
-          audioElement.volume = 1.0; // Full volume at element level
+          audioElement.volume = 1.0;
 
-          // Add comprehensive audio element event handlers
+          // Add basic error handling
           audioElement.onerror = (e) => {
             console.error(`❌ Audio element error for user ${userId}:`, e);
-          };
-
-          audioElement.onloadedmetadata = () => {
-            console.log(`✅ Audio metadata loaded for user ${userId}, duration: ${audioElement.duration}`);
-          };
-
-          audioElement.oncanplay = () => {
-            console.log(`✅ Audio element ready to play for user ${userId}`);
           };
 
           audioElement.onplay = () => {
             console.log(`▶️ Audio element started playing for user ${userId}`);
           };
 
-          audioElement.onpause = () => {
-            console.log(`⏸️ Audio element paused for user ${userId}`);
-          };
-
-          // Force audio element to play to ensure stream is active
+          // Force audio element to play
           try {
             await audioElement.play();
-            console.log(`🎵 Successfully started audio element playback for ${userId}`);
+            console.log(`✅ Audio element playing for ${userId}`);
           } catch (playError) {
-            console.error(`❌ Failed to start audio element playback for ${userId}:`, playError);
-            throw playError; // Re-throw to be caught by outer error handler
+            console.error(`❌ Failed to start audio element for ${userId}:`, playError);
+            throw playError;
           }
 
-          // Create Web Audio source from the HTMLAudioElement (avoids "stream already in use" errors)
+          // Create the basic Web Audio chain: MediaElementSource -> GainNode -> Destination
           const source = audioContextRef.current!.createMediaElementSource(audioElement);
-
-          // Create PannerNode for positional audio (HRTF preferred)
-          const pannerNode = audioContextRef.current!.createPanner();
-          pannerNode.panningModel = 'HRTF';
-          pannerNode.distanceModel = 'inverse';
-          pannerNode.refDistance = 1;
-          pannerNode.maxDistance = 10;
-          pannerNode.rolloffFactor = 1;
-          pannerNode.coneInnerAngle = 360;
-          pannerNode.coneOuterAngle = 0;
-          pannerNode.coneOuterGain = 0;
-
           const gainNode = audioContextRef.current!.createGain();
 
-          // Connect: HTMLAudioElement → MediaElementSource → PannerNode → GainNode → Destination
-          source.connect(pannerNode);
-          pannerNode.connect(gainNode);
+          // Simple connection without PannerNode for now
+          source.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Audio graph connected for ${userId}: HTMLAudioElement -> MediaElementSource -> PannerNode -> GainNode -> Destination`);
+          console.log(`🔊 Basic audio graph connected for ${userId}: HTMLAudioElement -> MediaElementSource -> GainNode -> Destination`);
 
-          // Update the existing connection with the audio element, gain node, and panner node
+          // Update or create the connection
           const existingConnection = audioConnectionsRef.current.get(userId);
           if (existingConnection) {
             existingConnection.audioElement = audioElement;
             existingConnection.gainNode = gainNode;
-            existingConnection.pannerNode = pannerNode;
-            console.log(`✅ Updated audio connection for ${userId}`);
+            // pannerNode stays undefined for now
+            console.log(`✅ Updated basic audio connection for ${userId}`);
           } else {
-            // Fallback: create new connection if it doesn't exist
             const connection: AudioConnection = {
               userId,
               peerConnection: pc,
               audioElement,
               gainNode,
-              pannerNode,
+              // pannerNode stays undefined for now
             };
             audioConnectionsRef.current.set(userId, connection);
-            console.log(`✅ Created new audio connection for ${userId}`);
+            console.log(`✅ Created basic audio connection for ${userId}`);
           }
 
-          // Immediately trigger spatial audio calculation to avoid muting race condition
+          // Set initial gain based on distance (simple calculation)
           if (currentUser) {
             const otherUser = roomState.users.find((u) => u.id === userId);
             if (otherUser) {
               const initialGain = calculateSpatialGain(currentUser.position, otherUser.position);
               gainNode.gain.setValueAtTime(initialGain, audioContextRef.current!.currentTime);
-
-              // Set initial 3D position
-              const audioCoords = convertToAudioCoordinates(currentUser.position, otherUser.position);
-              if (pannerNode.positionX) {
-                pannerNode.positionX.setValueAtTime(audioCoords.x, audioContextRef.current!.currentTime);
-                pannerNode.positionY.setValueAtTime(audioCoords.y, audioContextRef.current!.currentTime);
-                pannerNode.positionZ.setValueAtTime(audioCoords.z, audioContextRef.current!.currentTime);
-              } else {
-                pannerNode.setPosition(audioCoords.x, audioCoords.y, audioCoords.z);
-              }
-
-              console.log(`🎯 Set initial spatial audio for ${userId}: gain=${initialGain.toFixed(2)}, position=(${audioCoords.x.toFixed(1)}, ${audioCoords.y.toFixed(1)}, ${audioCoords.z.toFixed(1)})`);
+              console.log(`🎯 Set initial gain for ${userId}: ${initialGain.toFixed(2)}`);
             } else {
-              // If we don't have position data yet, set a reasonable default (center, audible)
+              // Default to audible volume
               gainNode.gain.setValueAtTime(0.5, audioContextRef.current!.currentTime);
-              if (pannerNode.positionX) {
-                pannerNode.positionX.setValueAtTime(0, audioContextRef.current!.currentTime);
-                pannerNode.positionY.setValueAtTime(0, audioContextRef.current!.currentTime);
-                pannerNode.positionZ.setValueAtTime(-1, audioContextRef.current!.currentTime);
-              } else {
-                pannerNode.setPosition(0, 0, -1);
-              }
-              console.log(`🎯 Set default spatial audio for ${userId}: gain=0.5, position=(0, 0, -1) - will update when position data available`);
+              console.log(`🎯 Set default gain for ${userId}: 0.5`);
             }
           }
 
-          // Immediately call updateSpatialAudio to kickstart proper levels
-          console.log(`🚀 Kickstarting spatial audio for ${userId}`);
+          // Trigger spatial audio update for all connections
+          console.log(`🔄 Triggering spatial audio update after connecting ${userId}`);
           updateSpatialAudio();
 
         } catch (error) {
-          console.error(`❌ Error setting up audio for user ${userId}:`, error);
+          console.error(`❌ Error setting up basic audio for user ${userId}:`, error);
 
-          // Surface the actual error name and message for obvious diagnosis
+          // Surface the actual error for diagnosis
           if (error instanceof Error) {
-            console.error(`🔍 ERROR DETAILS:`);
-            console.error(`  Name: ${error.name}`);
-            console.error(`  Message: ${error.message}`);
-            console.error(`  Stack:`, error.stack);
-          } else {
-            console.error(`🔍 NON-ERROR EXCEPTION:`, typeof error, error);
+            console.error(`🔍 ERROR: ${error.name} - ${error.message}`);
           }
 
-          // Log comprehensive stream and audio context state
-          console.error(`🔍 AUDIO STATE for ${userId}:`);
-          console.error(`  AudioContext State: ${audioContextRef.current?.state}`);
-          console.error(`  Stream Details:`, {
-            streamId: event.streams[0]?.id,
-            streamActive: event.streams[0]?.active,
-            trackCount: event.streams[0]?.getTracks().length,
-            tracks: event.streams[0]?.getTracks().map(t => ({
-              kind: t.kind,
-              enabled: t.enabled,
-              readyState: t.readyState,
-              muted: t.muted,
-              label: t.label
-            }))
-          });
-
-          // Log existing connections for context
-          console.error(`🔍 EXISTING CONNECTIONS:`, Array.from(audioConnectionsRef.current.keys()));
-
-          // Clean up on error to prevent retry loops and resource leaks
+          // Clean up failed connection
           const failedConnection = audioConnectionsRef.current.get(userId);
           if (failedConnection) {
             console.log(`🧹 Cleaning up failed connection for ${userId}`);
@@ -645,8 +530,9 @@ export default function SpatialAudioChat() {
             audioConnectionsRef.current.delete(userId);
           }
 
-          // Don't rethrow - log and continue to prevent cascade failures
-          console.error(`⚠️ Audio setup failed for ${userId}, but continuing operation`);
+          // SAFEGUARD: If spatial wiring fails, fall back to basic connection without audio
+          // This prevents users from being completely silent
+          console.warn(`⚠️ Audio setup failed for ${userId}, user will be silent but app continues`);
         }
       };
 
@@ -961,45 +847,7 @@ export default function SpatialAudioChat() {
 
     console.log(`🚶 Moving from ${currentUser.seatId} to ${seatId}`);
 
-    // Optimistic update: immediately update local state
-    const optimisticRoomState = { ...roomState };
-    const optimisticSeats = optimisticRoomState.seats.map(seat => {
-      if (seat.id === currentUser.seatId) {
-        // Free current seat
-        return { ...seat, occupied: false, userId: undefined };
-      } else if (seat.id === seatId) {
-        // Occupy new seat
-        return { ...seat, occupied: true, userId: currentUser.id };
-      }
-      return seat;
-    });
-
-    const optimisticUsers = optimisticRoomState.users.map(user => {
-      if (user.id === currentUser.id) {
-        const newSeat = targetSeat;
-        return {
-          ...user,
-          position: newSeat.position,
-          seatId: seatId
-        };
-      }
-      return user;
-    });
-
-    optimisticRoomState.seats = optimisticSeats;
-    optimisticRoomState.users = optimisticUsers;
-
-    // Update current user optimistically
-    const optimisticCurrentUser = {
-      ...currentUser,
-      position: targetSeat.position,
-      seatId: seatId
-    };
-
-    console.log(`🔮 Optimistic update: moving to position ${JSON.stringify(targetSeat.position)}`);
-    setRoomState(optimisticRoomState);
-    setCurrentUser(optimisticCurrentUser);
-
+    // Simple server-driven update - no optimistic mutations for now
     socket.send(
       JSON.stringify({
         type: "move",
