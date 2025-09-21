@@ -1,36 +1,118 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# KoolerTawk - Spatial Audio Chat
 
-## Getting Started
+A real-time spatial audio chat application built with Next.js 15 and PartyKit. Users can join virtual rooms, select seats, and communicate using proximity-based spatial audio with 3D positioning.
 
-First, run the development server:
+## Features
+
+- **🎧 3D Spatial Audio**: HRTF-based stereo positioning with distance-based volume
+- **🗺️ Interactive Seat Map**: 4x4 grid of seats with visual position indicators
+- **⚡ Real-time Communication**: WebRTC peer-to-peer audio with PartyKit signaling
+- **🔊 Proximity Chat**: Audio and text messages limited to users within hearing range
+- **🎤 Audio Testing Tools**: Built-in microphone and speaker testing
+- **📱 Responsive Design**: Works on desktop and mobile devices
+
+## Quick Start
 
 ```bash
+# Install dependencies
+npm install
+
+# Start development server
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+
+# Build for production
+npm run build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) to access the application.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Audio Architecture
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### Stable Audio Pipeline ⚠️ CRITICAL
+The application uses a **muted HTMLAudioElement + Web Audio pipeline** to ensure reliable playback and avoid "stream already in use" crashes:
 
-## Learn More
+```
+Remote MediaStream → HTMLAudioElement (muted) → Web Audio Graph → Speakers
+                                                     ↓
+                                   MediaElementSource → PannerNode → GainNode → Destination
+```
 
-To learn more about Next.js, take a look at the following resources:
+**Key Implementation Details:**
+- **HTMLAudioElement**: Set `srcObject`, `muted=true`, `volume=1.0`, then call `.play()`
+- **MediaElementSource**: Created from audio element (NOT directly from MediaStream)
+- **Immediate Kickstart**: `updateSpatialAudio()` called right after node wiring
+- **No Silent Periods**: Audio flows immediately with proper gain values
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+**⚠️ Do NOT change this to direct MediaStreamSource - it will cause browser crashes!**
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### Spatial Audio Features
+- **Distance-Based Volume**: Closer users sound louder (inverse square law)
+- **Stereo Positioning**: Users positioned left/right/front/back in stereo field
+- **Hearing Range**: 80% room distance maximum, with multiple volume zones
+- **Optimistic Updates**: Position changes update audio immediately
 
-## Deploy on Vercel
+## Technology Stack
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- **Frontend**: Next.js 15 with App Router, React 19, TypeScript
+- **Styling**: Tailwind CSS v4 with CSS custom properties
+- **Real-time**: PartyKit for WebSocket server and signaling
+- **Audio**: Web Audio API with WebRTC for peer-to-peer communication
+- **Build**: Turbopack for fast development and builds
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Development
+
+### Project Structure
+```
+src/app/                 # Next.js App Router
+├── components/          # React components
+│   └── SpatialAudioChat.tsx  # Main audio chat component
+├── globals.css          # Tailwind CSS styles
+└── page.tsx            # Home page
+
+party/
+└── index.ts            # PartyKit server for real-time features
+
+TESTING.md              # Comprehensive testing guide
+CLAUDE.md               # Development guidance
+```
+
+### Key Commands
+```bash
+npm run dev             # Development with Turbopack
+npm run build           # Production build
+npm run lint            # ESLint checking
+```
+
+### Testing
+See [TESTING.md](./TESTING.md) for comprehensive manual testing scenarios, console debugging guides, and regression tests.
+
+## Deployment
+
+### Environment Variables
+```bash
+NEXT_PUBLIC_PARTYKIT_URL=your-party.username.partykit.dev
+```
+
+### Cloudflare Pages
+The Next.js app deploys to Cloudflare Pages with proper environment variable configuration.
+
+### PartyKit Server
+Deploy the real-time server separately:
+```bash
+npx partykit deploy
+```
+
+## Browser Compatibility
+
+- **Chrome/Chromium**: Full support (recommended)
+- **Firefox**: Full support
+- **Safari**: WebRTC limitations may affect some features
+- **Mobile**: Works on iOS Safari and Android Chrome
+
+## Architecture Notes
+
+This project implements a sophisticated audio pipeline to handle the complexities of WebRTC streams and Web Audio API. Future enhancements should preserve the muted HTMLAudioElement approach to maintain stability across browsers.
+
+## License
+
+MIT License

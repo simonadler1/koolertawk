@@ -504,7 +504,16 @@ export default function SpatialAudioChat() {
             console.log(`⏸️ Audio element paused for user ${userId}`);
           };
 
-          // Create Web Audio source from the HTMLAudioElement (more stable than MediaStream)
+          // Force audio element to play to ensure stream is active
+          try {
+            await audioElement.play();
+            console.log(`🎵 Successfully started audio element playback for ${userId}`);
+          } catch (playError) {
+            console.error(`❌ Failed to start audio element playback for ${userId}:`, playError);
+            throw playError; // Re-throw to be caught by outer error handler
+          }
+
+          // Create Web Audio source from the HTMLAudioElement (avoids "stream already in use" errors)
           const source = audioContextRef.current!.createMediaElementSource(audioElement);
 
           // Create PannerNode for positional audio (HRTF preferred)
@@ -547,14 +556,6 @@ export default function SpatialAudioChat() {
             console.log(`✅ Created new audio connection for ${userId}`);
           }
 
-          // Force audio element to play and ensure it's properly started
-          try {
-            await audioElement.play();
-            console.log(`🎵 Successfully started audio playback for ${userId}`);
-          } catch (playError) {
-            console.error(`❌ Failed to start audio playback for ${userId}:`, playError);
-          }
-
           // Immediately trigger spatial audio calculation to avoid muting race condition
           if (currentUser) {
             const otherUser = roomState.users.find((u) => u.id === userId);
@@ -587,24 +588,27 @@ export default function SpatialAudioChat() {
             }
           }
 
-          // Schedule a follow-up spatial audio update to ensure everything is correct
-          setTimeout(() => {
-            console.log(`⏰ Running delayed spatial audio update for ${userId}`);
-            updateSpatialAudio();
-          }, 100);
+          // Immediately call updateSpatialAudio to kickstart proper levels
+          console.log(`🚀 Kickstarting spatial audio for ${userId}`);
+          updateSpatialAudio();
 
         } catch (error) {
           console.error(`❌ Error setting up audio for user ${userId}:`, error);
 
-          // Log detailed error information for debugging
+          // Surface the actual error name and message for obvious diagnosis
           if (error instanceof Error) {
-            console.error(`Error name: ${error.name}`);
-            console.error(`Error message: ${error.message}`);
-            console.error(`Error stack:`, error.stack);
+            console.error(`🔍 ERROR DETAILS:`);
+            console.error(`  Name: ${error.name}`);
+            console.error(`  Message: ${error.message}`);
+            console.error(`  Stack:`, error.stack);
+          } else {
+            console.error(`🔍 NON-ERROR EXCEPTION:`, typeof error, error);
           }
 
-          // Log stream state for debugging
-          console.error(`Stream state for ${userId}:`, {
+          // Log comprehensive stream and audio context state
+          console.error(`🔍 AUDIO STATE for ${userId}:`);
+          console.error(`  AudioContext State: ${audioContextRef.current?.state}`);
+          console.error(`  Stream Details:`, {
             streamId: event.streams[0]?.id,
             streamActive: event.streams[0]?.active,
             trackCount: event.streams[0]?.getTracks().length,
@@ -612,24 +616,37 @@ export default function SpatialAudioChat() {
               kind: t.kind,
               enabled: t.enabled,
               readyState: t.readyState,
-              muted: t.muted
+              muted: t.muted,
+              label: t.label
             }))
           });
 
-          // Clean up on error to prevent retry loops
+          // Log existing connections for context
+          console.error(`🔍 EXISTING CONNECTIONS:`, Array.from(audioConnectionsRef.current.keys()));
+
+          // Clean up on error to prevent retry loops and resource leaks
           const failedConnection = audioConnectionsRef.current.get(userId);
           if (failedConnection) {
             console.log(`🧹 Cleaning up failed connection for ${userId}`);
-            failedConnection.peerConnection.close();
+            try {
+              failedConnection.peerConnection.close();
+            } catch (closeError) {
+              console.error(`Error closing peer connection:`, closeError);
+            }
+
             if (failedConnection.audioElement) {
-              failedConnection.audioElement.pause();
-              failedConnection.audioElement.srcObject = null;
+              try {
+                failedConnection.audioElement.pause();
+                failedConnection.audioElement.srcObject = null;
+              } catch (audioError) {
+                console.error(`Error cleaning up audio element:`, audioError);
+              }
             }
             audioConnectionsRef.current.delete(userId);
           }
 
-          // Rethrow to trigger peer connection failure handling
-          throw error;
+          // Don't rethrow - log and continue to prevent cascade failures
+          console.error(`⚠️ Audio setup failed for ${userId}, but continuing operation`);
         }
       };
 
