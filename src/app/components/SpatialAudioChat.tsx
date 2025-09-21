@@ -428,12 +428,12 @@ export default function SpatialAudioChat() {
             await audioContextRef.current.resume();
           }
 
-          // KNOWN-GOOD PIPELINE: HTMLAudioElement -> MediaElementSource -> GainNode -> Destination
+          // KNOWN-GOOD PIPELINE (8691645): HTMLAudioElement -> MediaElementSource -> GainNode -> Destination
           // This prevents "stream already in use" errors that crash browsers
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          audioElement.muted = true; // Muted so Web Audio controls the volume
+          audioElement.muted = false; // Unmuted per 8691645 flow
           audioElement.volume = 1.0;
 
           // Add basic error handling
@@ -483,19 +483,9 @@ export default function SpatialAudioChat() {
             console.log(`✅ Created basic audio connection for ${userId}`);
           }
 
-          // Set initial gain based on distance (simple calculation)
-          if (currentUser) {
-            const otherUser = roomState.users.find((u) => u.id === userId);
-            if (otherUser) {
-              const initialGain = calculateSpatialGain(currentUser.position, otherUser.position);
-              gainNode.gain.setValueAtTime(initialGain, audioContextRef.current!.currentTime);
-              console.log(`🎯 Set initial gain for ${userId}: ${initialGain.toFixed(2)}`);
-            } else {
-              // Default to audible volume
-              gainNode.gain.setValueAtTime(0.5, audioContextRef.current!.currentTime);
-              console.log(`🎯 Set default gain for ${userId}: 0.5`);
-            }
-          }
+          // Set initial gain to 1.0 per 8691645, then let updateSpatialAudio handle distance
+          gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
+          console.log(`🎯 Set initial gain for ${userId}: 1.0 (8691645 flow)`);
 
           // Trigger spatial audio update for all connections
           console.log(`🔄 Triggering spatial audio update after connecting ${userId}`);
