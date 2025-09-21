@@ -462,6 +462,13 @@ export default function SpatialAudioChat() {
           }))
         });
 
+        // Check if we already have an audio setup for this stream to prevent duplicates
+        const existingConnection = audioConnectionsRef.current.get(userId);
+        if (existingConnection?.audioElement?.srcObject === event.streams[0]) {
+          console.log(`⚠️ Already have audio setup for stream ${event.streams[0]?.id} from ${userId}, skipping`);
+          return;
+        }
+
         try {
           // Ensure AudioContext is still active
           if (audioContextRef.current?.state === "suspended") {
@@ -469,8 +476,36 @@ export default function SpatialAudioChat() {
             await audioContextRef.current.resume();
           }
 
-          // Create Web Audio source directly from the MediaStream (no Audio element)
-          const source = audioContextRef.current!.createMediaStreamSource(event.streams[0]);
+          // Create HTMLAudioElement for stable stream handling (muted for Web Audio control)
+          const audioElement = new Audio();
+          audioElement.srcObject = event.streams[0];
+          audioElement.autoplay = true;
+          audioElement.muted = true; // Muted so Web Audio controls the volume
+          audioElement.volume = 1.0; // Full volume at element level
+
+          // Add comprehensive audio element event handlers
+          audioElement.onerror = (e) => {
+            console.error(`❌ Audio element error for user ${userId}:`, e);
+          };
+
+          audioElement.onloadedmetadata = () => {
+            console.log(`✅ Audio metadata loaded for user ${userId}, duration: ${audioElement.duration}`);
+          };
+
+          audioElement.oncanplay = () => {
+            console.log(`✅ Audio element ready to play for user ${userId}`);
+          };
+
+          audioElement.onplay = () => {
+            console.log(`▶️ Audio element started playing for user ${userId}`);
+          };
+
+          audioElement.onpause = () => {
+            console.log(`⏸️ Audio element paused for user ${userId}`);
+          };
+
+          // Create Web Audio source from the HTMLAudioElement (more stable than MediaStream)
+          const source = audioContextRef.current!.createMediaElementSource(audioElement);
 
           // Create PannerNode for positional audio (HRTF preferred)
           const pannerNode = audioContextRef.current!.createPanner();
@@ -485,19 +520,12 @@ export default function SpatialAudioChat() {
 
           const gainNode = audioContextRef.current!.createGain();
 
-          // Set initial gain to 0 - will be set correctly by updateSpatialAudio
-          gainNode.gain.setValueAtTime(0, audioContextRef.current!.currentTime);
-
-          // Connect: MediaStreamSource → PannerNode → GainNode → Destination
+          // Connect: HTMLAudioElement → MediaElementSource → PannerNode → GainNode → Destination
           source.connect(pannerNode);
           pannerNode.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Audio graph connected for ${userId}: MediaStreamSource -> PannerNode -> GainNode -> Destination`);
-
-          // Create a dummy audio element for compatibility (not used for playback)
-          const audioElement = new Audio();
-          audioElement.muted = true; // Ensure it doesn't interfere
+          console.log(`🔊 Audio graph connected for ${userId}: HTMLAudioElement -> MediaElementSource -> PannerNode -> GainNode -> Destination`);
 
           // Update the existing connection with the audio element, gain node, and panner node
           const existingConnection = audioConnectionsRef.current.get(userId);
@@ -519,7 +547,15 @@ export default function SpatialAudioChat() {
             console.log(`✅ Created new audio connection for ${userId}`);
           }
 
-          // Set the initial spatial gain and position based on current positions
+          // Force audio element to play and ensure it's properly started
+          try {
+            await audioElement.play();
+            console.log(`🎵 Successfully started audio playback for ${userId}`);
+          } catch (playError) {
+            console.error(`❌ Failed to start audio playback for ${userId}:`, playError);
+          }
+
+          // Immediately trigger spatial audio calculation to avoid muting race condition
           if (currentUser) {
             const otherUser = roomState.users.find((u) => u.id === userId);
             if (otherUser) {
@@ -537,11 +573,63 @@ export default function SpatialAudioChat() {
               }
 
               console.log(`🎯 Set initial spatial audio for ${userId}: gain=${initialGain.toFixed(2)}, position=(${audioCoords.x.toFixed(1)}, ${audioCoords.y.toFixed(1)}, ${audioCoords.z.toFixed(1)})`);
+            } else {
+              // If we don't have position data yet, set a reasonable default (center, audible)
+              gainNode.gain.setValueAtTime(0.5, audioContextRef.current!.currentTime);
+              if (pannerNode.positionX) {
+                pannerNode.positionX.setValueAtTime(0, audioContextRef.current!.currentTime);
+                pannerNode.positionY.setValueAtTime(0, audioContextRef.current!.currentTime);
+                pannerNode.positionZ.setValueAtTime(-1, audioContextRef.current!.currentTime);
+              } else {
+                pannerNode.setPosition(0, 0, -1);
+              }
+              console.log(`🎯 Set default spatial audio for ${userId}: gain=0.5, position=(0, 0, -1) - will update when position data available`);
             }
           }
 
+          // Schedule a follow-up spatial audio update to ensure everything is correct
+          setTimeout(() => {
+            console.log(`⏰ Running delayed spatial audio update for ${userId}`);
+            updateSpatialAudio();
+          }, 100);
+
         } catch (error) {
           console.error(`❌ Error setting up audio for user ${userId}:`, error);
+
+          // Log detailed error information for debugging
+          if (error instanceof Error) {
+            console.error(`Error name: ${error.name}`);
+            console.error(`Error message: ${error.message}`);
+            console.error(`Error stack:`, error.stack);
+          }
+
+          // Log stream state for debugging
+          console.error(`Stream state for ${userId}:`, {
+            streamId: event.streams[0]?.id,
+            streamActive: event.streams[0]?.active,
+            trackCount: event.streams[0]?.getTracks().length,
+            tracks: event.streams[0]?.getTracks().map(t => ({
+              kind: t.kind,
+              enabled: t.enabled,
+              readyState: t.readyState,
+              muted: t.muted
+            }))
+          });
+
+          // Clean up on error to prevent retry loops
+          const failedConnection = audioConnectionsRef.current.get(userId);
+          if (failedConnection) {
+            console.log(`🧹 Cleaning up failed connection for ${userId}`);
+            failedConnection.peerConnection.close();
+            if (failedConnection.audioElement) {
+              failedConnection.audioElement.pause();
+              failedConnection.audioElement.srcObject = null;
+            }
+            audioConnectionsRef.current.delete(userId);
+          }
+
+          // Rethrow to trigger peer connection failure handling
+          throw error;
         }
       };
 
