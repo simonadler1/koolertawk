@@ -319,10 +319,10 @@ export default function SpatialAudioChat() {
         console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
       }
     });
-  }, [currentUser?.position?.x, currentUser?.position?.y, roomState.users.length, calculateSpatialGain]);
+  }, [currentUser, roomState.users, calculateSpatialGain]);
 
   const createPeerConnection = useCallback(
-    async (userId: string): Promise<RTCPeerConnection> => {
+    async (userId: string, streamToUse?: MediaStream): Promise<RTCPeerConnection> => {
       console.log(`Creating peer connection for user ${userId}`);
 
       const pc = new RTCPeerConnection({
@@ -362,24 +362,38 @@ export default function SpatialAudioChat() {
         throw new Error("Audio context initialization failed");
       }
 
-      // Add local stream tracks if available
-      const currentLocalStream = localStream;
+      // Use the provided stream or fall back to the current localStream
+      const currentLocalStream = streamToUse || localStream;
       if (currentLocalStream && currentLocalStream.active) {
         const tracks = currentLocalStream.getTracks();
+        console.log(`📤 Local stream details for ${userId}:`, {
+          active: currentLocalStream.active,
+          trackCount: tracks.length,
+          tracks: tracks.map(t => ({
+            kind: t.kind,
+            enabled: t.enabled,
+            readyState: t.readyState,
+            muted: t.muted
+          }))
+        });
+
         if (tracks.length === 0) {
-          console.warn("Local stream has no tracks");
+          console.warn("⚠️ Local stream has no tracks");
         } else {
           tracks.forEach((track) => {
             if (track.readyState === "live") {
-              console.log(`Adding local ${track.kind} track to peer connection with ${userId}`);
+              console.log(`✅ Adding local ${track.kind} track to peer connection with ${userId}`);
               pc.addTrack(track, currentLocalStream);
             } else {
-              console.warn(`Track ${track.kind} is not live (${track.readyState})`);
+              console.warn(`⚠️ Track ${track.kind} is not live (${track.readyState})`);
             }
           });
         }
       } else {
-        console.warn(`No active local stream available when creating connection for ${userId}`);
+        console.warn(`⚠️ No active local stream available when creating connection for ${userId}`, {
+          localStream: !!currentLocalStream,
+          active: currentLocalStream?.active
+        });
       }
 
       pc.ontrack = async (event) => {
@@ -520,7 +534,56 @@ export default function SpatialAudioChat() {
             })),
             totalUsers: data.payload.users.length
           });
+
+          // Check for new users that we need to establish connections with
+          if (isJoined && currentUser && audioEnabled) {
+            const existingConnections = new Set(audioConnectionsRef.current.keys());
+            const newUsers = data.payload.users.filter((u: User) =>
+              u.id !== currentUser.id &&
+              u.audioEnabled &&
+              !existingConnections.has(u.id)
+            );
+
+            console.log(`🔍 Found ${newUsers.length} new users to connect to:`, newUsers.map((u: User) => u.name));
+
+            // Create offers to new users
+            newUsers.forEach(async (newUser: User) => {
+              try {
+                console.log(`🔗 Creating offer for new user ${newUser.id} (${newUser.name})`);
+                const pc = await createPeerConnection(newUser.id);
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                  socket.send(
+                    JSON.stringify({
+                      type: "audio_offer",
+                      payload: {
+                        offer,
+                        targetUserId: newUser.id,
+                      },
+                    })
+                  );
+                  console.log(`📤 Sent offer to new user ${newUser.id} (${newUser.name})`);
+                } else {
+                  console.warn(`⚠️ Cannot send offer to ${newUser.name}: socket not ready`);
+                }
+              } catch (error) {
+                console.error(`❌ Error creating connection for new user ${newUser.name}:`, error);
+              }
+            });
+          }
+
           setRoomState(data.payload);
+
+          // Update currentUser if it exists and we're joined
+          if (isJoined && currentUser) {
+            const updatedCurrentUser = data.payload.users.find((u: User) => u.id === currentUser.id);
+            if (updatedCurrentUser) {
+              console.log(`👤 Updating current user position: ${JSON.stringify(updatedCurrentUser.position)}`);
+              setCurrentUser(updatedCurrentUser);
+            }
+          }
           break;
 
         case "chat_message":
@@ -577,6 +640,7 @@ export default function SpatialAudioChat() {
 
     const handleSignaling = async (event: MessageEvent) => {
       const data = JSON.parse(event.data);
+      console.log(`📡 Received signaling message:`, data.type, data.payload);
 
       switch (data.type) {
         case "audio_offer":
@@ -685,7 +749,7 @@ export default function SpatialAudioChat() {
         if (otherUser.audioEnabled) {
           try {
             console.log(`🔗 Creating offer for existing user ${otherUser.id} (${otherUser.name})`);
-            const pc = await createPeerConnection(otherUser.id);
+            const pc = await createPeerConnection(otherUser.id, stream);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
@@ -723,7 +787,7 @@ export default function SpatialAudioChat() {
     );
   };
 
-  const toggleAudio = () => {
+  const toggleAudio = async () => {
     if (!socket || !localStream) return;
 
     const audioTrack = localStream.getAudioTracks()[0];
@@ -732,14 +796,47 @@ export default function SpatialAudioChat() {
       audioTrack.enabled = newAudioEnabled;
       setAudioEnabled(newAudioEnabled);
 
-      // If disabling audio, close all peer connections to stop sending audio
-      if (!newAudioEnabled) {
-        console.log("Audio disabled, cleaning up peer connections");
-        audioConnectionsRef.current.forEach((connection) => {
-          connection.peerConnection.close();
-          connection.audioElement.pause();
-        });
-        audioConnectionsRef.current.clear();
+      console.log(`🎤 Audio ${newAudioEnabled ? 'enabled' : 'disabled'}`);
+
+      // If re-enabling audio, we need to create new offers since tracks were disabled
+      if (newAudioEnabled && isJoined && currentUser) {
+        console.log("🔄 Re-enabling audio, creating new offers to existing users");
+
+        // Get all users that should have audio connections
+        const usersToReconnect = roomState.users.filter(u =>
+          u.id !== currentUser.id && u.audioEnabled
+        );
+
+        for (const otherUser of usersToReconnect) {
+          try {
+            // Check if we already have a connection, if so close it first
+            const existingConnection = audioConnectionsRef.current.get(otherUser.id);
+            if (existingConnection) {
+              console.log(`🔄 Closing existing connection with ${otherUser.name} before renegotiation`);
+              existingConnection.peerConnection.close();
+              existingConnection.audioElement.pause();
+              audioConnectionsRef.current.delete(otherUser.id);
+            }
+
+            console.log(`🔗 Creating new offer for ${otherUser.name} after audio re-enable`);
+            const pc = await createPeerConnection(otherUser.id, localStream);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            socket.send(
+              JSON.stringify({
+                type: "audio_offer",
+                payload: {
+                  offer,
+                  targetUserId: otherUser.id,
+                },
+              })
+            );
+            console.log(`📤 Sent new offer to ${otherUser.name}`);
+          } catch (error) {
+            console.error(`❌ Error reconnecting to ${otherUser.name}:`, error);
+          }
+        }
       }
 
       socket.send(
