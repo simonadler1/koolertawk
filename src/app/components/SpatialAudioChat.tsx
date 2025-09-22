@@ -70,6 +70,24 @@ export default function SpatialAudioChat() {
   const liveMicAnalyserRef = useRef<AnalyserNode | null>(null);
   const liveMicAnimationFrameRef = useRef<number | null>(null);
 
+  // Refs to prevent stale closures in WebSocket handlers
+  const currentUserRef = useRef<User | null>(null);
+  const isJoinedRef = useRef<boolean>(false);
+  const audioEnabledRef = useRef<boolean>(true);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  useEffect(() => {
+    isJoinedRef.current = isJoined;
+  }, [isJoined]);
+
+  useEffect(() => {
+    audioEnabledRef.current = audioEnabled;
+  }, [audioEnabled]);
+
   const initializeAudioContext = useCallback(async () => {
     if (!audioContextRef.current) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -588,10 +606,15 @@ export default function SpatialAudioChat() {
           });
 
           // Check for new users that we need to establish connections with
-          if (isJoined && currentUser && audioEnabled) {
+          // Use refs to avoid stale closure issues
+          const currentIsJoined = isJoinedRef.current;
+          const currentCurrentUser = currentUserRef.current;
+          const currentAudioEnabled = audioEnabledRef.current;
+
+          if (currentIsJoined && currentCurrentUser && currentAudioEnabled) {
             const existingConnections = new Set(audioConnectionsRef.current.keys());
             const newUsers = data.payload.users.filter((u: User) =>
-              u.id !== currentUser.id &&
+              u.id !== currentCurrentUser.id &&
               u.audioEnabled &&
               !existingConnections.has(u.id)
             );
@@ -636,16 +659,18 @@ export default function SpatialAudioChat() {
           };
           setRoomState(clonedRoomState);
 
-          // Update currentUser if it exists and we're joined
-          if (isJoined && currentUser) {
-            const updatedCurrentUser = clonedRoomState.users.find((u: User) => u.id === currentUser.id);
+          // Update currentUser if it exists and we're joined - use refs to avoid stale closure
+          if (currentIsJoined && currentCurrentUser) {
+            const updatedCurrentUser = clonedRoomState.users.find((u: User) => u.id === currentCurrentUser.id);
             if (updatedCurrentUser) {
-              console.log(`👤 Updating current user position: ${JSON.stringify(updatedCurrentUser.position)}`);
-              setCurrentUser(updatedCurrentUser);
+              console.log(`👤 Updating current user position: from (${currentCurrentUser.position.x},${currentCurrentUser.position.y}) to (${updatedCurrentUser.position.x},${updatedCurrentUser.position.y})`);
+
+              // Create a new object to ensure React sees the change
+              const newCurrentUser = { ...updatedCurrentUser, position: { ...updatedCurrentUser.position } };
+              setCurrentUser(newCurrentUser);
 
               // Trigger spatial audio update immediately after currentUser position update
               console.log(`🔄 Triggering spatial audio update after position change`);
-              // Note: updateSpatialAudio will use the updated currentUser from the closure
               setTimeout(() => updateSpatialAudio(), 0);
             }
           }
@@ -1207,17 +1232,28 @@ export default function SpatialAudioChat() {
                 />
               )}
 
-              {/* Debug: Show position coordinates */}
+              {/* Debug: Show position coordinates and movement tracking */}
               {process.env.NODE_ENV === "development" && currentUser && (
-                <div
-                  className="absolute bg-blue-600 text-white text-xs px-2 py-1 rounded pointer-events-none"
-                  style={{
-                    left: `${currentUser.position.x}%`,
-                    top: `${currentUser.position.y - 8}%`,
-                  }}
-                >
-                  {Math.round(currentUser.position.x)},{Math.round(currentUser.position.y)}
-                </div>
+                <>
+                  <div
+                    className="absolute bg-blue-600 text-white text-xs px-2 py-1 rounded pointer-events-none"
+                    style={{
+                      left: `${currentUser.position.x}%`,
+                      top: `${currentUser.position.y - 8}%`,
+                    }}
+                  >
+                    {Math.round(currentUser.position.x)},{Math.round(currentUser.position.y)}
+                  </div>
+                  <div
+                    className="absolute bg-green-600 text-white text-xs px-2 py-1 rounded pointer-events-none"
+                    style={{
+                      left: `${currentUser.position.x}%`,
+                      top: `${currentUser.position.y + 8}%`,
+                    }}
+                  >
+                    ID: {currentUser.id.slice(-4)}
+                  </div>
+                </>
               )}
             </div>
             <p className="text-sm text-black mt-2 font-semibold">
