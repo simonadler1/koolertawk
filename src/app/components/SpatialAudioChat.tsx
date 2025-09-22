@@ -308,6 +308,7 @@ export default function SpatialAudioChat() {
     }
 
     console.log(`🔊 Updating spatial audio for ${audioConnectionsRef.current.size} connections`);
+    console.log(`👤 Current user position: x=${currentUser.position.x}, y=${currentUser.position.y}`);
 
     audioConnectionsRef.current.forEach((connection, userId) => {
       const otherUser = roomState.users.find((u) => u.id === userId);
@@ -319,19 +320,23 @@ export default function SpatialAudioChat() {
           Math.pow(otherUser.position.y - currentUser.position.y, 2)
         );
 
-        // Set gain
+        // Set gain and log the actual applied value
         connection.gainNode.gain.setValueAtTime(gain, audioContextRef.current!.currentTime);
+        const actualGain = connection.gainNode.gain.value;
 
-        // Log with or without panner info
+        // Enhanced logging with gain verification
+        console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% targetGain=${gain.toFixed(3)} actualGain=${actualGain.toFixed(3)}`);
+        console.log(`🔗 Audio chain status for ${otherUser.name}: AudioElement(muted=${connection.audioElement.muted}) -> GainNode(gain=${actualGain.toFixed(3)}) -> Destination`);
+
         if (connection.pannerNode) {
-          console.log(`🎧 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)} (with panner)`);
-        } else {
-          console.log(`🔊 User ${otherUser.name}: distance=${Math.round(distance)}%, gain=${gain.toFixed(2)} (gain only)`);
+          console.log(`🎧 User ${otherUser.name} has panner node enabled`);
         }
       } else {
         console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
       }
     });
+
+    console.log(`✅ Spatial audio update completed at ${audioContextRef.current.currentTime.toFixed(3)}s`);
   }, [currentUser, roomState.users, calculateSpatialGain]);
 
   const createPeerConnection = useCallback(
@@ -433,8 +438,8 @@ export default function SpatialAudioChat() {
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          audioElement.muted = false; // Unmuted per 8691645 flow
-          audioElement.volume = 1.0;
+          audioElement.muted = true; // RE-MUTED: GainNode becomes sole output for spatial control
+          audioElement.volume = 0.0; // Lower volume so GainNode controls output
 
           // Add basic error handling
           audioElement.onerror = (e) => {
@@ -462,7 +467,12 @@ export default function SpatialAudioChat() {
           source.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Basic audio graph connected for ${userId}: HTMLAudioElement -> MediaElementSource -> GainNode -> Destination`);
+          console.log(`🔊 Audio chain connected for ${userId}: HTMLAudioElement(muted=${audioElement.muted}, vol=${audioElement.volume}) -> MediaElementSource -> GainNode -> Destination`);
+          console.log(`🎯 GainNode details for ${userId}:`, {
+            numberOfInputs: gainNode.numberOfInputs,
+            numberOfOutputs: gainNode.numberOfOutputs,
+            connected: true
+          });
 
           // Update or create the connection
           const existingConnection = audioConnectionsRef.current.get(userId);
@@ -624,6 +634,11 @@ export default function SpatialAudioChat() {
             if (updatedCurrentUser) {
               console.log(`👤 Updating current user position: ${JSON.stringify(updatedCurrentUser.position)}`);
               setCurrentUser(updatedCurrentUser);
+
+              // Trigger spatial audio update immediately after currentUser position update
+              console.log(`🔄 Triggering spatial audio update after position change`);
+              // Note: updateSpatialAudio will use the updated currentUser from the closure
+              setTimeout(() => updateSpatialAudio(), 0);
             }
           }
           break;
