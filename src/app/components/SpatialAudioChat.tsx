@@ -35,6 +35,8 @@ interface AudioConnection {
   source?: MediaElementAudioSourceNode;
   gainNode?: GainNode;
   pannerNode?: PannerNode;
+  usingWebAudio: boolean;
+  connectionType: 'spatial' | 'basic' | 'direct';
 }
 
 export default function SpatialAudioChat() {
@@ -78,6 +80,56 @@ export default function SpatialAudioChat() {
 
   // Stable reference for spatial settings function
   const applySpatialSettingsRef = useRef<(() => void) | null>(null);
+
+  // Cleanup function for audio connections
+  const cleanupAudioConnection = useCallback((userId: string, reason: string) => {
+    const connection = audioConnectionsRef.current.get(userId);
+    if (!connection) {
+      console.log(`⚠️ No connection to cleanup for ${userId}`);
+      return;
+    }
+
+    console.log(`🧹 Cleaning up audio connection for ${userId}: ${reason}`);
+
+    try {
+      // Pause and reset audio element
+      connection.audioElement.pause();
+      connection.audioElement.srcObject = null;
+      console.log(`✅ Audio element cleaned for ${userId}`);
+    } catch (error) {
+      console.error(`❌ Error cleaning audio element for ${userId}:`, error);
+    }
+
+    try {
+      // Disconnect Web Audio nodes
+      if (connection.source) {
+        connection.source.disconnect();
+        console.log(`✅ MediaElementSource disconnected for ${userId}`);
+      }
+      if (connection.pannerNode) {
+        connection.pannerNode.disconnect();
+        console.log(`✅ PannerNode disconnected for ${userId}`);
+      }
+      if (connection.gainNode) {
+        connection.gainNode.disconnect();
+        console.log(`✅ GainNode disconnected for ${userId}`);
+      }
+    } catch (error) {
+      console.error(`❌ Error disconnecting Web Audio nodes for ${userId}:`, error);
+    }
+
+    try {
+      // Close peer connection
+      connection.peerConnection.close();
+      console.log(`✅ PeerConnection closed for ${userId}`);
+    } catch (error) {
+      console.error(`❌ Error closing peer connection for ${userId}:`, error);
+    }
+
+    // Remove from map
+    audioConnectionsRef.current.delete(userId);
+    console.log(`✅ Connection removed from map for ${userId}`);
+  }, []);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -324,7 +376,7 @@ export default function SpatialAudioChat() {
   // TODO: Re-add positional audio after basic playback is stable
 
 
-  // Simplified spatial audio update - distance-based gain only
+  // Enhanced spatial audio update - supports both basic gain and full spatial positioning
   const updateSpatialAudio = useCallback(() => {
     const currentCurrentUser = currentUserRef.current;
     if (!currentCurrentUser || !audioContextRef.current) {
@@ -347,13 +399,43 @@ export default function SpatialAudioChat() {
           Math.pow(otherUser.position.y - currentCurrentUser.position.y, 2)
         );
 
-        // Apply gain only if using Web Audio
-        if (connection.source) {
+        // Handle different connection types
+        if (connection.connectionType === 'spatial' && connection.pannerNode) {
+          // Full spatial audio with 3D positioning
+          try {
+            // Convert room coordinates to 3D meters
+            const x = (otherUser.position.x - 50) * 0.2; // -10 to +10 meters
+            const z = (otherUser.position.y - 50) * 0.2; // -10 to +10 meters
+            const y = 0; // Keep on ground plane
+
+            // Position the panner
+            if (connection.pannerNode.positionX) {
+              connection.pannerNode.positionX.setValueAtTime(x, currentTime);
+              connection.pannerNode.positionY.setValueAtTime(y, currentTime);
+              connection.pannerNode.positionZ.setValueAtTime(z, currentTime);
+            } else if (connection.pannerNode.setPosition) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              (connection.pannerNode as any).setPosition(x, y, z);
+            }
+
+            // Apply distance-based gain
+            connection.gainNode.gain.setValueAtTime(gain, currentTime);
+            const actualGain = connection.gainNode.gain.value;
+
+            console.log(`🎧 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}) distance=${Math.round(distance)}% gain=${actualGain.toFixed(3)} (spatial)`);
+          } catch (pannerError) {
+            console.error(`❌ Failed to position panner for ${otherUser.name}:`, pannerError);
+          }
+
+        } else if (connection.connectionType === 'basic' && connection.usingWebAudio) {
+          // Basic Web Audio with distance-based gain only
           connection.gainNode.gain.setValueAtTime(gain, currentTime);
           const actualGain = connection.gainNode.gain.value;
-          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% gain=${actualGain.toFixed(3)} (Web Audio)`);
+          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% gain=${actualGain.toFixed(3)} (basic Web Audio)`);
+
         } else {
-          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% (direct playback, no gain control)`);
+          // Direct HTMLAudioElement playback - no gain control
+          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% (direct playback, no spatial control)`);
         }
       } else {
         console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
@@ -389,13 +471,15 @@ export default function SpatialAudioChat() {
         gainNode: undefined,
       });
 
-      // Add connection state monitoring
+      // Add connection state monitoring with proper cleanup
       pc.onconnectionstatechange = () => {
         console.log(`WebRTC connection with ${userId}: ${pc.connectionState}`);
         if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
           console.warn(`Audio connection lost with user ${userId}`);
-          // Clean up the connection
-          audioConnectionsRef.current.delete(userId);
+          cleanupAudioConnection(userId, `connection ${pc.connectionState}`);
+        } else if (pc.connectionState === "closed") {
+          console.log(`Connection properly closed for ${userId}`);
+          cleanupAudioConnection(userId, "connection closed");
         }
       };
 
@@ -460,139 +544,169 @@ export default function SpatialAudioChat() {
           }))
         });
 
+        // Clean up any existing connection first (Chrome restriction: one MediaElementSource per stream)
+        const existingConnection = audioConnectionsRef.current.get(userId);
+        if (existingConnection) {
+          cleanupAudioConnection(userId, "renegotiation");
+        }
+
         try {
-          // Ensure AudioContext is still active
+          // Ensure AudioContext is ready
           if (audioContextRef.current?.state === "suspended") {
             console.log(`Resuming suspended audio context for ${userId}`);
             await audioContextRef.current.resume();
           }
 
-          // KNOWN-GOOD PIPELINE: HTMLAudioElement(unmuted) -> MediaElementSource -> GainNode -> Destination
+          // Step 1: Create brand new HTMLAudioElement for this stream
+          console.log(`🔧 Creating fresh audio element for ${userId}`);
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          audioElement.muted = false; // UNMUTED: Proven working path from 7eeabc8
+          audioElement.muted = false; // Keep unmuted initially for fallback
           audioElement.volume = 1.0;
 
-          // Add basic error handling
+          // Enhanced error handling
           audioElement.onerror = (e) => {
             console.error(`❌ Audio element error for user ${userId}:`, e);
           };
 
           audioElement.onplay = () => {
-            console.log(`▶️ Audio element started playing for user ${userId}`);
+            console.log(`▶️ Audio element started playing for ${userId}`);
           };
 
-          // Force audio element to play
-          try {
-            await audioElement.play();
-            console.log(`✅ Audio element playing for ${userId}`);
-          } catch (playError) {
-            console.error(`❌ Failed to start audio element for ${userId}:`, playError);
-            throw playError;
-          }
+          // Step 2: Ensure element starts playing
+          console.log(`🎬 Starting audio playback for ${userId}`);
+          await audioElement.play();
+          console.log(`✅ Audio element playing for ${userId}`);
 
+          // Step 3: Attempt to build Web Audio graph
           let source: MediaElementAudioSourceNode | undefined;
-          let gainNode: GainNode;
-          let usingWebAudio = false;
+          let gainNode: GainNode | undefined;
+          let pannerNode: PannerNode | undefined;
+          let connectionType: 'spatial' | 'basic' | 'direct' = 'direct';
+          let graphSuccessful = false;
 
           try {
-            // Create basic Web Audio chain: MediaElementSource -> GainNode -> Destination
+            console.log(`🔧 Building Web Audio graph for ${userId}`);
+
+            // Create MediaElementSource immediately after element plays
             source = audioContextRef.current!.createMediaElementSource(audioElement);
-            gainNode = audioContextRef.current!.createGain();
+            console.log(`✅ MediaElementSource created for ${userId}`);
 
-            // Simple connection without PannerNode for proven stability
-            source.connect(gainNode);
-            gainNode.connect(audioContextRef.current!.destination);
+            // Try spatial audio first
+            try {
+              pannerNode = audioContextRef.current!.createPanner();
+              gainNode = audioContextRef.current!.createGain();
 
-            usingWebAudio = true;
-            console.log(`🔊 Basic Web Audio chain connected for ${userId}: HTMLAudioElement(unmuted) -> MediaElementSource -> GainNode -> Destination`);
+              // Configure PannerNode for spatial audio
+              pannerNode.panningModel = 'HRTF';
+              pannerNode.distanceModel = 'inverse';
+              pannerNode.refDistance = 1;
+              pannerNode.maxDistance = 20;
+              pannerNode.rolloffFactor = 1;
+
+              // Connect: MediaElementSource -> PannerNode -> GainNode -> Destination
+              source.connect(pannerNode);
+              pannerNode.connect(gainNode);
+              gainNode.connect(audioContextRef.current!.destination);
+
+              connectionType = 'spatial';
+              console.log(`🎧 Spatial audio graph connected for ${userId}: Source -> PannerNode -> GainNode -> Destination`);
+            } catch (pannerError) {
+              console.warn(`⚠️ PannerNode failed for ${userId}, falling back to basic:`, pannerError);
+
+              // Clean up partial spatial setup
+              if (pannerNode) {
+                try { pannerNode.disconnect(); } catch { /* ignore */ }
+                pannerNode = undefined;
+              }
+
+              // Basic Web Audio: MediaElementSource -> GainNode -> Destination
+              gainNode = audioContextRef.current!.createGain();
+              source.connect(gainNode);
+              gainNode.connect(audioContextRef.current!.destination);
+
+              connectionType = 'basic';
+              console.log(`🔊 Basic Web Audio graph connected for ${userId}: Source -> GainNode -> Destination`);
+            }
+
+            graphSuccessful = true;
+
+            // Step 4: Mute element ONLY after Web Audio graph is successfully connected
+            console.log(`🔇 Muting audio element for ${userId} - Web Audio now controls output`);
+            audioElement.muted = true;
+
           } catch (webAudioError) {
-            console.error(`❌ Failed to create Web Audio chain for ${userId}:`, webAudioError);
-            console.warn(`⚠️ Using direct HTMLAudioElement playback for ${userId} (no Web Audio)`);
+            console.error(`❌ Web Audio graph creation failed for ${userId}:`, webAudioError);
+            console.warn(`⚠️ Falling back to direct HTMLAudioElement playback for ${userId}`);
 
-            // Fallback: direct HTMLAudioElement playback (already unmuted)
+            // Clean up any partial Web Audio setup
+            if (source) {
+              try { source.disconnect(); } catch { /* ignore */ }
+              source = undefined;
+            }
+            if (gainNode) {
+              try { gainNode.disconnect(); } catch { /* ignore */ }
+              gainNode = undefined;
+            }
+            if (pannerNode) {
+              try { pannerNode.disconnect(); } catch { /* ignore */ }
+              pannerNode = undefined;
+            }
+
+            // Keep element unmuted for direct playback
+            audioElement.muted = false;
+            connectionType = 'direct';
+
             // Create dummy gain node for API compatibility
             gainNode = audioContextRef.current!.createGain();
             gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
-            source = undefined;
-            usingWebAudio = false;
           }
 
-          // Update or create the connection
-          const existingConnection = audioConnectionsRef.current.get(userId);
-          if (existingConnection) {
-            existingConnection.audioElement = audioElement;
-            existingConnection.source = source;
-            existingConnection.gainNode = gainNode;
-            existingConnection.pannerNode = undefined; // No panner in basic mode
-            console.log(`✅ Updated ${usingWebAudio ? 'Web Audio' : 'direct'} connection for ${userId}`);
-          } else {
-            const connection: AudioConnection = {
-              userId,
-              peerConnection: pc,
-              audioElement,
-              source,
-              gainNode,
-              pannerNode: undefined // No panner in basic mode
-            };
-            audioConnectionsRef.current.set(userId, connection);
-            console.log(`✅ Created ${usingWebAudio ? 'Web Audio' : 'direct'} connection for ${userId}`);
-          }
+          // Step 5: Store connection with full metadata
+          const connection: AudioConnection = {
+            userId,
+            peerConnection: pc,
+            audioElement,
+            source,
+            gainNode,
+            pannerNode,
+            usingWebAudio: graphSuccessful,
+            connectionType
+          };
+          audioConnectionsRef.current.set(userId, connection);
 
-          // Set initial gain - Web Audio or dummy
-          if (usingWebAudio) {
+          // Step 6: Set initial gain
+          if (graphSuccessful && gainNode) {
             gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
-            console.log(`🎯 Set initial Web Audio gain for ${userId}: 1.0`);
-          } else {
-            console.log(`🎯 Using direct HTMLAudioElement playback for ${userId} (no gain control)`);
+            console.log(`🎯 Set initial gain for ${userId}: 1.0 (${connectionType} mode)`);
           }
 
-          // Log connection diagnostics
-          console.log(`🔍 Connection diagnostics for ${userId}:`, {
-            usingWebAudio,
+          // Step 7: Comprehensive diagnostics
+          console.log(`🔍 Connection established for ${userId}:`, {
+            connectionType,
+            usingWebAudio: graphSuccessful,
+            elementMuted: audioElement.muted,
+            elementVolume: audioElement.volume,
             hasSource: !!source,
             hasGainNode: !!gainNode,
-            elementMuted: audioElement.muted,
-            elementVolume: audioElement.volume
+            hasPannerNode: !!pannerNode
           });
 
-          // Trigger basic spatial audio update (distance-based gain only)
+          // Step 8: Trigger spatial audio update
           console.log(`🔄 Updating spatial audio after connecting ${userId}`);
           updateSpatialAudio();
 
         } catch (error) {
-          console.error(`❌ Error setting up basic audio for user ${userId}:`, error);
+          console.error(`❌ Critical error setting up audio for user ${userId}:`, error);
 
-          // Surface the actual error for diagnosis
           if (error instanceof Error) {
             console.error(`🔍 ERROR: ${error.name} - ${error.message}`);
           }
 
-          // Clean up failed connection
-          const failedConnection = audioConnectionsRef.current.get(userId);
-          if (failedConnection) {
-            console.log(`🧹 Cleaning up failed connection for ${userId}`);
-            try {
-              failedConnection.peerConnection.close();
-            } catch (closeError) {
-              console.error(`Error closing peer connection:`, closeError);
-            }
-
-            if (failedConnection.audioElement) {
-              try {
-                failedConnection.audioElement.pause();
-                failedConnection.audioElement.srcObject = null;
-              } catch (audioError) {
-                console.error(`Error cleaning up audio element:`, audioError);
-              }
-            }
-            audioConnectionsRef.current.delete(userId);
-          }
-
-          // SAFEGUARD: If spatial wiring fails, fall back to basic connection without audio
-          // This prevents users from being completely silent
-          console.warn(`⚠️ Audio setup failed for ${userId}, user will be silent but app continues`);
+          // Final cleanup on total failure
+          cleanupAudioConnection(userId, "critical error");
+          console.warn(`⚠️ Audio completely failed for ${userId}, user will be silent`);
         }
       };
 
@@ -735,13 +849,12 @@ export default function SpatialAudioChat() {
     return () => {
       ws.close();
 
-      // Clean up all peer connections - copy ref to local variable for cleanup
+      // Clean up all peer connections using proper cleanup function
       const connectionsSnapshot = audioConnectionsRef.current;
-      connectionsSnapshot.forEach((conn) => {
-        conn.peerConnection.close();
-        conn.audioElement.pause();
+      const userIds = Array.from(connectionsSnapshot.keys());
+      userIds.forEach((userId) => {
+        cleanupAudioConnection(userId, "component unmount");
       });
-      connectionsSnapshot.clear();
 
       // Stop local media stream
       if (localStream) {
