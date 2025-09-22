@@ -326,7 +326,7 @@ export default function SpatialAudioChat() {
 
         // Enhanced logging with gain verification
         console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% targetGain=${gain.toFixed(3)} actualGain=${actualGain.toFixed(3)}`);
-        console.log(`🔗 Audio chain status for ${otherUser.name}: AudioElement(muted=${connection.audioElement.muted}) -> GainNode(gain=${actualGain.toFixed(3)}) -> Destination`);
+        console.log(`🔗 Audio chain status for ${otherUser.name}: AudioElement(unmuted, vol=${connection.audioElement.volume}) -> GainNode(gain=${actualGain.toFixed(3)}) -> Destination`);
 
         if (connection.pannerNode) {
           console.log(`🎧 User ${otherUser.name} has panner node enabled`);
@@ -438,8 +438,8 @@ export default function SpatialAudioChat() {
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          audioElement.muted = true; // RE-MUTED: GainNode becomes sole output for spatial control
-          audioElement.volume = 0.0; // Lower volume so GainNode controls output
+          audioElement.muted = false; // RESTORED: HTMLAudioElement provides audible path
+          audioElement.volume = 1.0; // Full volume - GainNode will attenuate
 
           // Add basic error handling
           audioElement.onerror = (e) => {
@@ -467,7 +467,7 @@ export default function SpatialAudioChat() {
           source.connect(gainNode);
           gainNode.connect(audioContextRef.current!.destination);
 
-          console.log(`🔊 Audio chain connected for ${userId}: HTMLAudioElement(muted=${audioElement.muted}, vol=${audioElement.volume}) -> MediaElementSource -> GainNode -> Destination`);
+          console.log(`🔊 Audio chain connected for ${userId}: HTMLAudioElement(unmuted, vol=${audioElement.volume}) -> MediaElementSource -> GainNode -> Destination`);
           console.log(`🎯 GainNode details for ${userId}:`, {
             numberOfInputs: gainNode.numberOfInputs,
             numberOfOutputs: gainNode.numberOfOutputs,
@@ -626,11 +626,19 @@ export default function SpatialAudioChat() {
             });
           }
 
-          setRoomState(data.payload);
+          // Deep-clone room state to ensure React sees new references and re-renders
+          const clonedRoomState = {
+            seats: data.payload.seats.map((seat: Seat) => ({ ...seat })),
+            users: data.payload.users.map((user: User) => ({
+              ...user,
+              position: { ...user.position }
+            }))
+          };
+          setRoomState(clonedRoomState);
 
           // Update currentUser if it exists and we're joined
           if (isJoined && currentUser) {
-            const updatedCurrentUser = data.payload.users.find((u: User) => u.id === currentUser.id);
+            const updatedCurrentUser = clonedRoomState.users.find((u: User) => u.id === currentUser.id);
             if (updatedCurrentUser) {
               console.log(`👤 Updating current user position: ${JSON.stringify(updatedCurrentUser.position)}`);
               setCurrentUser(updatedCurrentUser);
