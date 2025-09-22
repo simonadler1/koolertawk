@@ -32,6 +32,7 @@ interface AudioConnection {
   userId: string;
   peerConnection: RTCPeerConnection;
   audioElement: HTMLAudioElement;
+  source?: MediaElementAudioSourceNode;
   gainNode?: GainNode;
   pannerNode?: PannerNode;
 }
@@ -88,12 +89,40 @@ export default function SpatialAudioChat() {
     audioEnabledRef.current = audioEnabled;
   }, [audioEnabled]);
 
+  // Convert room coordinates (0-100%) to 3D meters for Web Audio
+  const roomToMeters = useCallback((roomPos: Position): { x: number; y: number; z: number } => {
+    // Map 100% room to ±10 meters, center at origin
+    const x = (roomPos.x - 50) * 0.2; // -10 to +10 meters
+    const z = (roomPos.y - 50) * 0.2; // -10 to +10 meters (z is forward/back)
+    return { x, y: 0, z }; // Keep y=0 for 2D room layout
+  }, []);
+
   const initializeAudioContext = useCallback(async () => {
     if (!audioContextRef.current) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       console.log("Audio context created");
-      // Skip complex listener configuration for now - just use defaults
+
+      // Configure AudioListener for spatial audio
+      const listener = audioContextRef.current.listener;
+      if (listener.positionX) {
+        // Modern approach with AudioParam
+        listener.positionX.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.positionY.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.positionZ.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.forwardX.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.forwardY.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.forwardZ.setValueAtTime(-1, audioContextRef.current.currentTime);
+        listener.upX.setValueAtTime(0, audioContextRef.current.currentTime);
+        listener.upY.setValueAtTime(1, audioContextRef.current.currentTime);
+        listener.upZ.setValueAtTime(0, audioContextRef.current.currentTime);
+        console.log("🎧 AudioListener configured with modern API");
+      } else if (listener.setPosition) {
+        // Fallback for older browsers
+        listener.setPosition(0, 0, 0);
+        listener.setOrientation(0, 0, -1, 0, 1, 0);
+        console.log("🎧 AudioListener configured with legacy API");
+      }
     }
 
     if (audioContextRef.current.state === "suspended") {
@@ -319,43 +348,94 @@ export default function SpatialAudioChat() {
   // Simple spatial audio update - just distance-based gain for now
   // TODO: Re-add positional audio after basic playback is stable
 
-  const updateSpatialAudio = useCallback(() => {
-    if (!currentUser || !audioContextRef.current) {
-      console.log("⚠️ Cannot update spatial audio: missing currentUser or audioContext");
+  // Update AudioListener position when current user moves
+  const updateListenerPosition = useCallback((userPosition: Position) => {
+    if (!audioContextRef.current) return;
+
+    const listener = audioContextRef.current.listener;
+    const coords3D = roomToMeters(userPosition);
+    const currentTime = audioContextRef.current.currentTime;
+
+    try {
+      if (listener.positionX) {
+        // Modern approach with AudioParam
+        listener.positionX.setValueAtTime(coords3D.x, currentTime);
+        listener.positionY.setValueAtTime(coords3D.y, currentTime);
+        listener.positionZ.setValueAtTime(coords3D.z, currentTime);
+        console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)})`);
+      } else if (listener.setPosition) {
+        // Fallback for older browsers
+        listener.setPosition(coords3D.x, coords3D.y, coords3D.z);
+        console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)}) [legacy]`);
+      }
+    } catch (error) {
+      console.error("❌ Failed to update AudioListener position:", error);
+    }
+  }, [roomToMeters]);
+
+  // Comprehensive spatial settings application
+  const applySpatialSettings = useCallback(() => {
+    const currentCurrentUser = currentUserRef.current;
+    if (!currentCurrentUser || !audioContextRef.current) {
+      console.log("⚠️ Cannot apply spatial settings: missing currentUser or audioContext");
       return;
     }
 
-    console.log(`🔊 Updating spatial audio for ${audioConnectionsRef.current.size} connections`);
-    console.log(`👤 Current user position: x=${currentUser.position.x}, y=${currentUser.position.y}`);
+    console.log(`🔊 Applying spatial settings for ${audioConnectionsRef.current.size} connections`);
+    console.log(`👤 Current user position: x=${currentCurrentUser.position.x}, y=${currentCurrentUser.position.y}`);
+
+    // Update listener position
+    updateListenerPosition(currentCurrentUser.position);
+
+    const currentTime = audioContextRef.current.currentTime;
 
     audioConnectionsRef.current.forEach((connection, userId) => {
       const otherUser = roomState.users.find((u) => u.id === userId);
       if (otherUser && connection.gainNode) {
-        // Simple distance-based gain calculation
-        const gain = calculateSpatialGain(currentUser.position, otherUser.position);
+        // Calculate distance-based gain
+        const gain = calculateSpatialGain(currentCurrentUser.position, otherUser.position);
         const distance = Math.sqrt(
-          Math.pow(otherUser.position.x - currentUser.position.x, 2) +
-          Math.pow(otherUser.position.y - currentUser.position.y, 2)
+          Math.pow(otherUser.position.x - currentCurrentUser.position.x, 2) +
+          Math.pow(otherUser.position.y - currentCurrentUser.position.y, 2)
         );
 
-        // Set gain and log the actual applied value
-        connection.gainNode.gain.setValueAtTime(gain, audioContextRef.current!.currentTime);
-        const actualGain = connection.gainNode.gain.value;
+        // Apply gain
+        connection.gainNode.gain.setValueAtTime(gain, currentTime);
 
-        // Enhanced logging with gain verification
-        console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% targetGain=${gain.toFixed(3)} actualGain=${actualGain.toFixed(3)}`);
-        console.log(`🔗 Audio chain status for ${otherUser.name}: AudioElement(unmuted, vol=${connection.audioElement.volume}) -> GainNode(gain=${actualGain.toFixed(3)}) -> Destination`);
-
+        // Position the panner node if available
         if (connection.pannerNode) {
-          console.log(`🎧 User ${otherUser.name} has panner node enabled`);
+          const otherCoords3D = roomToMeters(otherUser.position);
+
+          try {
+            if (connection.pannerNode.positionX) {
+              // Modern approach
+              connection.pannerNode.positionX.setValueAtTime(otherCoords3D.x, currentTime);
+              connection.pannerNode.positionY.setValueAtTime(otherCoords3D.y, currentTime);
+              connection.pannerNode.positionZ.setValueAtTime(otherCoords3D.z, currentTime);
+            } else if (connection.pannerNode.setPosition) {
+              // Legacy fallback
+              connection.pannerNode.setPosition(otherCoords3D.x, otherCoords3D.y, otherCoords3D.z);
+            }
+
+            console.log(`🎯 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${otherCoords3D.x.toFixed(2)},${otherCoords3D.y.toFixed(2)},${otherCoords3D.z.toFixed(2)}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)}`);
+          } catch (error) {
+            console.error(`❌ Failed to position panner for ${otherUser.name}:`, error);
+          }
+        } else {
+          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)} (no panner)`);
         }
       } else {
         console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
       }
     });
 
-    console.log(`✅ Spatial audio update completed at ${audioContextRef.current.currentTime.toFixed(3)}s`);
-  }, [currentUser, roomState.users, calculateSpatialGain]);
+    console.log(`✅ Spatial settings applied at ${currentTime.toFixed(3)}s`);
+  }, [roomState.users, calculateSpatialGain, roomToMeters, updateListenerPosition]);
+
+  // Legacy function for backward compatibility
+  const updateSpatialAudio = useCallback(() => {
+    applySpatialSettings();
+  }, [applySpatialSettings]);
 
   const createPeerConnection = useCallback(
     async (userId: string, streamToUse?: MediaStream): Promise<RTCPeerConnection> => {
@@ -451,13 +531,12 @@ export default function SpatialAudioChat() {
             await audioContextRef.current.resume();
           }
 
-          // KNOWN-GOOD PIPELINE (8691645): HTMLAudioElement -> MediaElementSource -> GainNode -> Destination
-          // This prevents "stream already in use" errors that crash browsers
+          // SPATIAL AUDIO PIPELINE: HTMLAudioElement(muted) -> MediaElementSource -> PannerNode -> GainNode -> Destination
           const audioElement = new Audio();
           audioElement.srcObject = event.streams[0];
           audioElement.autoplay = true;
-          audioElement.muted = false; // RESTORED: HTMLAudioElement provides audible path
-          audioElement.volume = 1.0; // Full volume - GainNode will attenuate
+          audioElement.muted = true; // MUTED: Web Audio controls all output
+          audioElement.volume = 1.0;
 
           // Add basic error handling
           audioElement.onerror = (e) => {
@@ -477,47 +556,87 @@ export default function SpatialAudioChat() {
             throw playError;
           }
 
-          // Create the basic Web Audio chain: MediaElementSource -> GainNode -> Destination
-          const source = audioContextRef.current!.createMediaElementSource(audioElement);
-          const gainNode = audioContextRef.current!.createGain();
+          let source: MediaElementAudioSourceNode;
+          let pannerNode: PannerNode | undefined;
+          let gainNode: GainNode;
+          let usingSpatialAudio = false;
 
-          // Simple connection without PannerNode for now
-          source.connect(gainNode);
-          gainNode.connect(audioContextRef.current!.destination);
+          try {
+            // Create MediaElementSource
+            source = audioContextRef.current!.createMediaElementSource(audioElement);
 
-          console.log(`🔊 Audio chain connected for ${userId}: HTMLAudioElement(unmuted, vol=${audioElement.volume}) -> MediaElementSource -> GainNode -> Destination`);
-          console.log(`🎯 GainNode details for ${userId}:`, {
-            numberOfInputs: gainNode.numberOfInputs,
-            numberOfOutputs: gainNode.numberOfOutputs,
-            connected: true
-          });
+            // Try to create full spatial audio chain
+            try {
+              pannerNode = audioContextRef.current!.createPanner();
+              gainNode = audioContextRef.current!.createGain();
+
+              // Configure PannerNode for HRTF spatial audio
+              pannerNode.panningModel = 'HRTF';
+              pannerNode.distanceModel = 'inverse';
+              pannerNode.refDistance = 1;
+              pannerNode.maxDistance = 20;
+              pannerNode.rolloffFactor = 1;
+              pannerNode.coneInnerAngle = 360;
+              pannerNode.coneOuterAngle = 0;
+              pannerNode.coneOuterGain = 0;
+
+              // Connect: MediaElementSource -> PannerNode -> GainNode -> Destination
+              source.connect(pannerNode);
+              pannerNode.connect(gainNode);
+              gainNode.connect(audioContextRef.current!.destination);
+
+              usingSpatialAudio = true;
+              console.log(`🔊 Spatial audio chain connected for ${userId}: HTMLAudioElement(muted) -> MediaElementSource -> PannerNode -> GainNode -> Destination`);
+            } catch (pannerError) {
+              console.warn(`⚠️ PannerNode creation failed for ${userId}, falling back to gain-only:`, pannerError);
+
+              // Fallback: MediaElementSource -> GainNode -> Destination
+              gainNode = audioContextRef.current!.createGain();
+              source.connect(gainNode);
+              gainNode.connect(audioContextRef.current!.destination);
+
+              console.log(`🔊 Fallback audio chain connected for ${userId}: HTMLAudioElement(muted) -> MediaElementSource -> GainNode -> Destination`);
+            }
+          } catch (sourceError) {
+            console.error(`❌ Failed to create MediaElementSource for ${userId}:`, sourceError);
+
+            // Ultimate fallback: unmute the element and let it play directly
+            audioElement.muted = false;
+            console.warn(`⚠️ Using direct HTMLAudioElement playback for ${userId} (no Web Audio)`);
+
+            // Create dummy gain node for API compatibility
+            gainNode = audioContextRef.current!.createGain();
+            gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
+          }
 
           // Update or create the connection
           const existingConnection = audioConnectionsRef.current.get(userId);
           if (existingConnection) {
             existingConnection.audioElement = audioElement;
+            existingConnection.source = source;
             existingConnection.gainNode = gainNode;
-            // pannerNode stays undefined for now
-            console.log(`✅ Updated basic audio connection for ${userId}`);
+            existingConnection.pannerNode = pannerNode;
+            console.log(`✅ Updated ${usingSpatialAudio ? 'spatial' : 'basic'} audio connection for ${userId}`);
           } else {
             const connection: AudioConnection = {
               userId,
               peerConnection: pc,
               audioElement,
+              source,
               gainNode,
-              // pannerNode stays undefined for now
+              pannerNode
             };
             audioConnectionsRef.current.set(userId, connection);
-            console.log(`✅ Created basic audio connection for ${userId}`);
+            console.log(`✅ Created ${usingSpatialAudio ? 'spatial' : 'basic'} audio connection for ${userId}`);
           }
 
-          // Set initial gain to 1.0 per 8691645, then let updateSpatialAudio handle distance
+          // Set initial gain and apply spatial settings
           gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
-          console.log(`🎯 Set initial gain for ${userId}: 1.0 (8691645 flow)`);
+          console.log(`🎯 Set initial gain for ${userId}: 1.0`);
 
-          // Trigger spatial audio update for all connections
-          console.log(`🔄 Triggering spatial audio update after connecting ${userId}`);
-          updateSpatialAudio();
+          // Trigger spatial settings application for all connections
+          console.log(`🔄 Applying spatial settings after connecting ${userId}`);
+          applySpatialSettings();
 
         } catch (error) {
           console.error(`❌ Error setting up basic audio for user ${userId}:`, error);
@@ -669,9 +788,9 @@ export default function SpatialAudioChat() {
               const newCurrentUser = { ...updatedCurrentUser, position: { ...updatedCurrentUser.position } };
               setCurrentUser(newCurrentUser);
 
-              // Trigger spatial audio update immediately after currentUser position update
-              console.log(`🔄 Triggering spatial audio update after position change`);
-              setTimeout(() => updateSpatialAudio(), 0);
+              // Trigger spatial settings update immediately after currentUser position update
+              console.log(`🔄 Applying spatial settings after position change`);
+              setTimeout(() => applySpatialSettings(), 0);
             }
           }
           break;
@@ -833,6 +952,9 @@ export default function SpatialAudioChat() {
 
       setCurrentUser(user);
       setIsJoined(true);
+
+      // Initialize AudioListener position for the current user
+      updateListenerPosition(user.position);
 
       // Create peer connections for existing users
       for (const otherUser of roomState.users) {
