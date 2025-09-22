@@ -76,6 +76,9 @@ export default function SpatialAudioChat() {
   const isJoinedRef = useRef<boolean>(false);
   const audioEnabledRef = useRef<boolean>(true);
 
+  // Stable reference for spatial settings function
+  const applySpatialSettingsRef = useRef<(() => void) | null>(null);
+
   // Keep refs in sync with state
   useEffect(() => {
     currentUserRef.current = currentUser;
@@ -348,89 +351,84 @@ export default function SpatialAudioChat() {
   // Simple spatial audio update - just distance-based gain for now
   // TODO: Re-add positional audio after basic playback is stable
 
-  // Update AudioListener position when current user moves
-  const updateListenerPosition = useCallback((userPosition: Position) => {
-    if (!audioContextRef.current) return;
 
-    const listener = audioContextRef.current.listener;
-    const coords3D = roomToMeters(userPosition);
-    const currentTime = audioContextRef.current.currentTime;
-
-    try {
-      if (listener.positionX) {
-        // Modern approach with AudioParam
-        listener.positionX.setValueAtTime(coords3D.x, currentTime);
-        listener.positionY.setValueAtTime(coords3D.y, currentTime);
-        listener.positionZ.setValueAtTime(coords3D.z, currentTime);
-        console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)})`);
-      } else if (listener.setPosition) {
-        // Fallback for older browsers
-        listener.setPosition(coords3D.x, coords3D.y, coords3D.z);
-        console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)}) [legacy]`);
+  // Create and store stable spatial settings function
+  useEffect(() => {
+    applySpatialSettingsRef.current = () => {
+      const currentCurrentUser = currentUserRef.current;
+      if (!currentCurrentUser || !audioContextRef.current) {
+        console.log("⚠️ Cannot apply spatial settings: missing currentUser or audioContext");
+        return;
       }
-    } catch (error) {
-      console.error("❌ Failed to update AudioListener position:", error);
-    }
-  }, [roomToMeters]);
 
-  // Comprehensive spatial settings application
-  const applySpatialSettings = useCallback(() => {
-    const currentCurrentUser = currentUserRef.current;
-    if (!currentCurrentUser || !audioContextRef.current) {
-      console.log("⚠️ Cannot apply spatial settings: missing currentUser or audioContext");
-      return;
-    }
+      console.log(`🔊 Applying spatial settings for ${audioConnectionsRef.current.size} connections`);
+      console.log(`👤 Current user position: x=${currentCurrentUser.position.x}, y=${currentCurrentUser.position.y}`);
 
-    console.log(`🔊 Applying spatial settings for ${audioConnectionsRef.current.size} connections`);
-    console.log(`👤 Current user position: x=${currentCurrentUser.position.x}, y=${currentCurrentUser.position.y}`);
+      // Update listener position
+      const listener = audioContextRef.current.listener;
+      const coords3D = roomToMeters(currentCurrentUser.position);
+      const currentTime = audioContextRef.current.currentTime;
 
-    // Update listener position
-    updateListenerPosition(currentCurrentUser.position);
+      try {
+        if (listener.positionX) {
+          listener.positionX.setValueAtTime(coords3D.x, currentTime);
+          listener.positionY.setValueAtTime(coords3D.y, currentTime);
+          listener.positionZ.setValueAtTime(coords3D.z, currentTime);
+          console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)})`);
+        } else if (listener.setPosition) {
+          listener.setPosition(coords3D.x, coords3D.y, coords3D.z);
+          console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)}) [legacy]`);
+        }
+      } catch (error) {
+        console.error("❌ Failed to update AudioListener position:", error);
+      }
 
-    const currentTime = audioContextRef.current.currentTime;
+      audioConnectionsRef.current.forEach((connection, userId) => {
+        const otherUser = roomState.users.find((u) => u.id === userId);
+        if (otherUser && connection.gainNode) {
+          // Calculate distance-based gain
+          const gain = calculateSpatialGain(currentCurrentUser.position, otherUser.position);
+          const distance = Math.sqrt(
+            Math.pow(otherUser.position.x - currentCurrentUser.position.x, 2) +
+            Math.pow(otherUser.position.y - currentCurrentUser.position.y, 2)
+          );
 
-    audioConnectionsRef.current.forEach((connection, userId) => {
-      const otherUser = roomState.users.find((u) => u.id === userId);
-      if (otherUser && connection.gainNode) {
-        // Calculate distance-based gain
-        const gain = calculateSpatialGain(currentCurrentUser.position, otherUser.position);
-        const distance = Math.sqrt(
-          Math.pow(otherUser.position.x - currentCurrentUser.position.x, 2) +
-          Math.pow(otherUser.position.y - currentCurrentUser.position.y, 2)
-        );
+          // Apply gain
+          connection.gainNode.gain.setValueAtTime(gain, currentTime);
 
-        // Apply gain
-        connection.gainNode.gain.setValueAtTime(gain, currentTime);
+          // Position the panner node if available
+          if (connection.pannerNode) {
+            const otherCoords3D = roomToMeters(otherUser.position);
 
-        // Position the panner node if available
-        if (connection.pannerNode) {
-          const otherCoords3D = roomToMeters(otherUser.position);
+            try {
+              if (connection.pannerNode.positionX) {
+                connection.pannerNode.positionX.setValueAtTime(otherCoords3D.x, currentTime);
+                connection.pannerNode.positionY.setValueAtTime(otherCoords3D.y, currentTime);
+                connection.pannerNode.positionZ.setValueAtTime(otherCoords3D.z, currentTime);
+              } else if (connection.pannerNode.setPosition) {
+                connection.pannerNode.setPosition(otherCoords3D.x, otherCoords3D.y, otherCoords3D.z);
+              }
 
-          try {
-            if (connection.pannerNode.positionX) {
-              // Modern approach
-              connection.pannerNode.positionX.setValueAtTime(otherCoords3D.x, currentTime);
-              connection.pannerNode.positionY.setValueAtTime(otherCoords3D.y, currentTime);
-              connection.pannerNode.positionZ.setValueAtTime(otherCoords3D.z, currentTime);
-            } else if (connection.pannerNode.setPosition) {
-              // Legacy fallback
-              connection.pannerNode.setPosition(otherCoords3D.x, otherCoords3D.y, otherCoords3D.z);
+              console.log(`🎯 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${otherCoords3D.x.toFixed(2)},${otherCoords3D.y.toFixed(2)},${otherCoords3D.z.toFixed(2)}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)}`);
+            } catch (error) {
+              console.error(`❌ Failed to position panner for ${otherUser.name}:`, error);
             }
-
-            console.log(`🎯 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${otherCoords3D.x.toFixed(2)},${otherCoords3D.y.toFixed(2)},${otherCoords3D.z.toFixed(2)}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)}`);
-          } catch (error) {
-            console.error(`❌ Failed to position panner for ${otherUser.name}:`, error);
+          } else {
+            console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)} (no panner)`);
           }
         } else {
-          console.log(`🎯 User ${otherUser.name}: pos=(${otherUser.position.x},${otherUser.position.y}) distance=${Math.round(distance)}% gain=${gain.toFixed(3)} (no panner)`);
+          console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
         }
-      } else {
-        console.log(`⚠️ Missing data for user ${userId}: otherUser=${!!otherUser}, gainNode=${!!connection.gainNode}`);
-      }
-    });
+      });
 
-    console.log(`✅ Spatial settings applied at ${currentTime.toFixed(3)}s`);
-  }, [roomState.users, calculateSpatialGain, roomToMeters, updateListenerPosition]);
+      console.log(`✅ Spatial settings applied at ${currentTime.toFixed(3)}s`);
+    };
+  }, [roomState.users, calculateSpatialGain, roomToMeters]);
+
+  // Stable applySpatialSettings function
+  const applySpatialSettings = useCallback(() => {
+    applySpatialSettingsRef.current?.();
+  }, []);
 
   // Legacy function for backward compatibility
   const updateSpatialAudio = useCallback(() => {
@@ -556,7 +554,7 @@ export default function SpatialAudioChat() {
             throw playError;
           }
 
-          let source: MediaElementAudioSourceNode;
+          let source: MediaElementAudioSourceNode | undefined;
           let pannerNode: PannerNode | undefined;
           let gainNode: GainNode;
           let usingSpatialAudio = false;
@@ -607,6 +605,7 @@ export default function SpatialAudioChat() {
             // Create dummy gain node for API compatibility
             gainNode = audioContextRef.current!.createGain();
             gainNode.gain.setValueAtTime(1.0, audioContextRef.current!.currentTime);
+            source = undefined; // No source created in this case
           }
 
           // Update or create the connection
@@ -696,7 +695,7 @@ export default function SpatialAudioChat() {
       console.log(`Peer connection created and stored for user ${userId}`);
       return pc;
     },
-    [initializeAudioContext, localStream, socket]
+    [initializeAudioContext, localStream, socket, applySpatialSettings]
   );
 
   useEffect(() => {
@@ -812,13 +811,13 @@ export default function SpatialAudioChat() {
     return () => {
       ws.close();
 
-      // Clean up all peer connections
-      const connections = audioConnectionsRef.current;
-      connections.forEach((conn) => {
+      // Clean up all peer connections - copy ref to local variable for cleanup
+      const connectionsSnapshot = audioConnectionsRef.current;
+      connectionsSnapshot.forEach((conn) => {
         conn.peerConnection.close();
         conn.audioElement.pause();
       });
-      connections.clear();
+      connectionsSnapshot.clear();
 
       // Stop local media stream
       if (localStream) {
@@ -841,7 +840,7 @@ export default function SpatialAudioChat() {
         audioContextRef.current.close();
       }
     };
-  }, []);
+  }, []); // Empty dependency array is intentional - this effect only runs once on mount
 
   // Handle WebRTC signaling messages
   useEffect(() => {
@@ -902,7 +901,8 @@ export default function SpatialAudioChat() {
         case "ice_candidate":
           if (data.payload.targetUserId === socket.id) {
             console.log(`Received ICE candidate from ${data.payload.fromUserId}`);
-            const connection = audioConnectionsRef.current.get(data.payload.fromUserId);
+            const connectionsSnapshot = audioConnectionsRef.current;
+            const connection = connectionsSnapshot.get(data.payload.fromUserId);
             if (connection) {
               try {
                 await connection.peerConnection.addIceCandidate(data.payload.candidate);
@@ -954,7 +954,25 @@ export default function SpatialAudioChat() {
       setIsJoined(true);
 
       // Initialize AudioListener position for the current user
-      updateListenerPosition(user.position);
+      if (audioContextRef.current) {
+        const listener = audioContextRef.current.listener;
+        const coords3D = roomToMeters(user.position);
+        const currentTime = audioContextRef.current.currentTime;
+
+        try {
+          if (listener.positionX) {
+            listener.positionX.setValueAtTime(coords3D.x, currentTime);
+            listener.positionY.setValueAtTime(coords3D.y, currentTime);
+            listener.positionZ.setValueAtTime(coords3D.z, currentTime);
+            console.log(`🎧 AudioListener initialized at (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)})`);
+          } else if (listener.setPosition) {
+            listener.setPosition(coords3D.x, coords3D.y, coords3D.z);
+            console.log(`🎧 AudioListener initialized at (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)}) [legacy]`);
+          }
+        } catch (error) {
+          console.error("❌ Failed to initialize AudioListener position:", error);
+        }
+      }
 
       // Create peer connections for existing users
       for (const otherUser of roomState.users) {
