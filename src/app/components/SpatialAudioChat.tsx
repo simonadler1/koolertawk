@@ -144,26 +144,100 @@ export default function SpatialAudioChat() {
     audioEnabledRef.current = audioEnabled;
   }, [audioEnabled]);
 
+  // Coordinate conversion: room percentages (0-100) to 3D meters
+  const roomToMeters = useCallback((roomPos: Position): { x: number; y: number; z: number } => {
+    // Map 100% room to ±10 meters, center at origin
+    const x = (roomPos.x - 50) * 0.2; // Left (-10m) to right (+10m)
+    const z = (roomPos.y - 50) * 0.2; // Front (-10m) to back (+10m)
+    return { x, y: 0, z }; // Keep y=0 for 2D room on ground plane
+  }, []);
+
+  // Update AudioListener position when current user moves
+  const updateListenerPosition = useCallback((userPosition: Position) => {
+    if (!audioContextRef.current) {
+      console.warn("⚠️ Cannot update listener position: no audio context");
+      return;
+    }
+
+    const listener = audioContextRef.current.listener;
+    const coords3D = roomToMeters(userPosition);
+    const currentTime = audioContextRef.current.currentTime;
+
+    try {
+      if (listener.positionX) {
+        // Modern AudioParam approach
+        listener.positionX.setValueAtTime(coords3D.x, currentTime);
+        listener.positionY.setValueAtTime(coords3D.y, currentTime);
+        listener.positionZ.setValueAtTime(coords3D.z, currentTime);
+        console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)})`);
+      } else {
+        // Legacy fallback
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (listener as any).setPosition?.(coords3D.x, coords3D.y, coords3D.z);
+          console.log(`🎧 AudioListener moved to (${coords3D.x.toFixed(2)}, ${coords3D.y.toFixed(2)}, ${coords3D.z.toFixed(2)}) [legacy]`);
+        } catch (legacyError) {
+          console.warn("⚠️ Legacy listener position update failed:", legacyError);
+        }
+      }
+    } catch (error) {
+      console.error("❌ Failed to update AudioListener position:", error);
+    }
+  }, [roomToMeters]);
 
   const initializeAudioContext = useCallback(async () => {
     if (!audioContextRef.current) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      console.log("Audio context created (basic mode - no spatial listener config)");
+      console.log("🎧 Audio context created with 3D spatial capabilities");
+
+      // Configure AudioListener for 3D spatial audio
+      try {
+        const listener = audioContextRef.current.listener;
+        const currentTime = audioContextRef.current.currentTime;
+
+        if (listener.positionX) {
+          // Modern AudioParam approach (preferred)
+          listener.positionX.setValueAtTime(0, currentTime);
+          listener.positionY.setValueAtTime(0, currentTime);
+          listener.positionZ.setValueAtTime(0, currentTime);
+          listener.forwardX.setValueAtTime(0, currentTime);
+          listener.forwardY.setValueAtTime(0, currentTime);
+          listener.forwardZ.setValueAtTime(-1, currentTime); // Looking down negative Z
+          listener.upX.setValueAtTime(0, currentTime);
+          listener.upY.setValueAtTime(1, currentTime);
+          listener.upZ.setValueAtTime(0, currentTime);
+          console.log("✅ AudioListener configured with modern AudioParam API");
+        } else {
+          // Legacy fallback for older browsers
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (listener as any).setPosition?.(0, 0, 0);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (listener as any).setOrientation?.(0, 0, -1, 0, 1, 0);
+            console.log("✅ AudioListener configured with legacy API");
+          } catch (legacyError) {
+            console.warn("⚠️ Legacy AudioListener API failed:", legacyError);
+          }
+        }
+      } catch (listenerError) {
+        console.warn("⚠️ Failed to configure AudioListener:", listenerError);
+        console.log("📻 Falling back to basic audio context");
+      }
     }
 
     if (audioContextRef.current.state === "suspended") {
-      console.log("Resuming suspended audio context");
+      console.log("🔄 Resuming suspended audio context");
       try {
         await audioContextRef.current.resume();
-        console.log("Audio context resumed successfully");
+        console.log("✅ Audio context resumed successfully");
       } catch (error) {
-        console.error("Failed to resume audio context:", error);
+        console.error("❌ Failed to resume audio context:", error);
         throw error;
       }
     }
 
-    console.log(`Audio context state: ${audioContextRef.current.state}`);
+    console.log(`🎵 Audio context state: ${audioContextRef.current.state}`);
   }, []);
 
   // Audio testing functions
@@ -376,7 +450,7 @@ export default function SpatialAudioChat() {
   // TODO: Re-add positional audio after basic playback is stable
 
 
-  // Enhanced spatial audio update - supports both basic gain and full spatial positioning
+  // Enhanced spatial audio update - supports full 3D positioning and listener movement
   const updateSpatialAudio = useCallback(() => {
     const currentCurrentUser = currentUserRef.current;
     if (!currentCurrentUser || !audioContextRef.current) {
@@ -386,6 +460,9 @@ export default function SpatialAudioChat() {
 
     console.log(`🔊 Updating spatial audio for ${audioConnectionsRef.current.size} connections`);
     console.log(`👤 Current user position: x=${currentCurrentUser.position.x}, y=${currentCurrentUser.position.y}`);
+
+    // Update AudioListener position first
+    updateListenerPosition(currentCurrentUser.position);
 
     const currentTime = audioContextRef.current.currentTime;
 
@@ -403,26 +480,29 @@ export default function SpatialAudioChat() {
         if (connection.connectionType === 'spatial' && connection.pannerNode) {
           // Full spatial audio with 3D positioning
           try {
-            // Convert room coordinates to 3D meters
-            const x = (otherUser.position.x - 50) * 0.2; // -10 to +10 meters
-            const z = (otherUser.position.y - 50) * 0.2; // -10 to +10 meters
-            const y = 0; // Keep on ground plane
+            // Convert room coordinates to 3D meters using shared function
+            const otherCoords3D = roomToMeters(otherUser.position);
 
             // Position the panner
             if (connection.pannerNode.positionX) {
-              connection.pannerNode.positionX.setValueAtTime(x, currentTime);
-              connection.pannerNode.positionY.setValueAtTime(y, currentTime);
-              connection.pannerNode.positionZ.setValueAtTime(z, currentTime);
-            } else if (connection.pannerNode.setPosition) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              (connection.pannerNode as any).setPosition(x, y, z);
+              connection.pannerNode.positionX.setValueAtTime(otherCoords3D.x, currentTime);
+              connection.pannerNode.positionY.setValueAtTime(otherCoords3D.y, currentTime);
+              connection.pannerNode.positionZ.setValueAtTime(otherCoords3D.z, currentTime);
+            } else {
+              // Legacy fallback
+              try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (connection.pannerNode as any).setPosition?.(otherCoords3D.x, otherCoords3D.y, otherCoords3D.z);
+              } catch (legacyError) {
+                console.warn(`⚠️ Legacy panner positioning failed for ${otherUser.name}:`, legacyError);
+              }
             }
 
             // Apply distance-based gain
             connection.gainNode.gain.setValueAtTime(gain, currentTime);
             const actualGain = connection.gainNode.gain.value;
 
-            console.log(`🎧 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}) distance=${Math.round(distance)}% gain=${actualGain.toFixed(3)} (spatial)`);
+            console.log(`🎧 User ${otherUser.name}: roomPos=(${otherUser.position.x},${otherUser.position.y}) 3DPos=(${otherCoords3D.x.toFixed(2)},${otherCoords3D.y.toFixed(2)},${otherCoords3D.z.toFixed(2)}) distance=${Math.round(distance)}% gain=${actualGain.toFixed(3)} (spatial)`);
           } catch (pannerError) {
             console.error(`❌ Failed to position panner for ${otherUser.name}:`, pannerError);
           }
@@ -443,7 +523,7 @@ export default function SpatialAudioChat() {
     });
 
     console.log(`✅ Spatial audio update completed at ${currentTime.toFixed(3)}s`);
-  }, [roomState.users, calculateSpatialGain]);
+  }, [roomState.users, calculateSpatialGain, updateListenerPosition, roomToMeters]);
 
   // Create and store stable spatial settings function for backward compatibility
   useEffect(() => {
@@ -468,7 +548,11 @@ export default function SpatialAudioChat() {
         userId,
         peerConnection: pc,
         audioElement: new Audio(), // Placeholder, will be replaced in ontrack
+        source: undefined,
         gainNode: undefined,
+        pannerNode: undefined,
+        usingWebAudio: false,
+        connectionType: 'direct'
       });
 
       // Add connection state monitoring with proper cleanup
@@ -990,7 +1074,9 @@ export default function SpatialAudioChat() {
       setCurrentUser(user);
       setIsJoined(true);
 
-      console.log(`👤 User joined at position (${user.position.x}, ${user.position.y}) - basic mode, no listener positioning`);
+      // Initialize AudioListener position when joining
+      console.log(`👤 User joined at position (${user.position.x}, ${user.position.y})`);
+      updateListenerPosition(user.position);
 
       // Create peer connections for existing users
       for (const otherUser of roomState.users) {
@@ -1413,6 +1499,29 @@ export default function SpatialAudioChat() {
                   </div>
                 </>
               )}
+
+              {/* Debug: Show audio connection diagnostics for each user */}
+              {process.env.NODE_ENV === "development" && roomState.users.map((user) => {
+                if (user.id === currentUser?.id) return null;
+                const connection = audioConnectionsRef.current.get(user.id);
+                const distance = currentUser ? Math.sqrt(
+                  Math.pow(user.position.x - currentUser.position.x, 2) +
+                  Math.pow(user.position.y - currentUser.position.y, 2)
+                ) : 0;
+
+                return (
+                  <div
+                    key={user.id}
+                    className="absolute bg-purple-600 text-white text-xs px-1 py-0.5 rounded pointer-events-none"
+                    style={{
+                      left: `${user.position.x + 5}%`,
+                      top: `${user.position.y - 2}%`,
+                    }}
+                  >
+                    {connection ? connection.connectionType[0].toUpperCase() : 'X'} {Math.round(distance)}%
+                  </div>
+                );
+              })}
             </div>
             <p className="text-sm text-black mt-2 font-semibold">
               🔵 You • 🟢 Available • 🔴 Occupied • 🎤 Audio enabled • 🔇 Muted
@@ -1421,6 +1530,28 @@ export default function SpatialAudioChat() {
               The large dashed circle shows your hearing range. Volume decreases with distance: 🔊 Full (very close) →
               🔉 High → 🔈 Medium → 🔇 Low (far edge).
             </p>
+
+            {/* Debug: Spatial Audio Status Panel */}
+            {process.env.NODE_ENV === "development" && (
+              <div className="mt-2 p-2 bg-gray-100 border border-black rounded text-xs">
+                <div className="font-bold mb-1">🎧 Spatial Audio Status</div>
+                <div>AudioContext: {audioContextRef.current?.state || 'not initialized'}</div>
+                <div>Connections: {audioConnectionsRef.current.size}</div>
+                <div className="flex gap-2 mt-1">
+                  {Array.from(audioConnectionsRef.current.entries()).map(([userId, conn]) => {
+                    const user = roomState.users.find(u => u.id === userId);
+                    return (
+                      <div key={userId} className="bg-white px-1 rounded border">
+                        {user?.name.slice(0, 3)}: {conn.connectionType[0].toUpperCase()}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="text-xs text-gray-600 mt-1">
+                  S=Spatial, B=Basic, D=Direct
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="bg-white border-2 border-black rounded-lg p-6">
